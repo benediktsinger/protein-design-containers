@@ -1,0 +1,70 @@
+BootStrap: docker
+From: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+%environment
+    export DEBIAN_FRONTEND=noninteractive
+    export PATH="/opt/venv/bin:$PATH"
+    export CCD_MIRROR_PATH=/opt/ccd_mirror
+    export CKPT_PATH=/root/.foundry/checkpoints/rfd3_latest.ckpt
+    export PYTHONPATH="/opt/rfdiffusion3:$PYTHONPATH"
+    export CUEQ_DISABLE_AOT_TUNING=1
+    export TRITON_CACHE_DIR=/tmp/triton_cache
+    export XDG_CACHE_HOME=/tmp/cache
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    umask 0000
+    
+    # Install software-properties-common first to get add-apt-repository
+    apt-get update && apt-get install -y software-properties-common
+    
+    # Add deadsnakes PPA for Python 3.12
+    add-apt-repository ppa:deadsnakes/ppa
+    
+    # Now install Python 3.12 and other dependencies
+    apt-get update && apt-get install -y \
+        python3.12 \
+        python3.12-venv \
+        python3-pip \
+        wget \
+        curl \
+        git \
+        build-essential \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Create working directory and venv
+    mkdir -p /opt/rfdiffusion3
+    cd /opt/rfdiffusion3
+    python3.12 -m venv /opt/venv
+
+    # Create cache directories with proper permissions BEFORE foundry install
+    mkdir -p /root/.cache/cuequivariance-triton
+    mkdir -p /root/.foundry/checkpoints
+    chmod -R 777 /root/.cache
+    chmod -R 777 /root/.foundry
+
+    # Upgrade pip and install uv
+    /opt/venv/bin/pip install --upgrade pip setuptools wheel
+    /opt/venv/bin/pip install uv
+
+    # Install rc-foundry with all extras
+    /opt/venv/bin/uv pip install --python /opt/venv/bin/python 'rc-foundry[all]'
+
+    # Install RFdiffusion3 tooling
+    /opt/venv/bin/foundry install rfd3
+
+    # Fix permissions on checkpoint after download
+    chmod -R 777 /root/.foundry/checkpoints
+
+    # Download CCD mirror
+    mkdir -p /opt/ccd_mirror
+    cd /opt/ccd_mirror
+    wget -q https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz
+    gunzip components.cif.gz
+
+    # Fix all root permissions
+    chmod -R 777 /root
+    chmod -R 777 /opt
+
+%runscript
+    exec /bin/bash "$@"
