@@ -7,7 +7,7 @@ This is an Apptainer container for RFDiffusion3, a software package for molecula
 Requires a linux system with Apptainer installed. You can build the container using the following command:
 
 ```
-apptainer build --force /home/singer/software/rfdiff3_docker/rfdiffusion3.sif /home/singer/software/rfdiff3_docker/rfdiffusion3.def
+apptainer build --force ./rfdiffusion3.sif ./rfdiffusion3.def
 ```
 
 ## Running the Container
