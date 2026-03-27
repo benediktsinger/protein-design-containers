@@ -17,7 +17,7 @@ ssh user@euler.ethz.ch
 
 EPFL
 ```
-Sinteract -p l40s -g l40s:1 -m 32GB -c 12 -t 2:00:00 TODO
+Sinteract -p l40s  -g gpu:1
 ```
 
 ETHZ
@@ -27,7 +27,7 @@ srun –pty –gpus=1 bash
 
 ## Step 3 Download the apptainer in a directory
 ```
-wget TODO
+wget https://filesender.switch.ch/filesender2/download.php?token=61a618dd-f3dc-456f-88b6-3372e4c3c708&files_ids=1209911
 
 ```
 
