@@ -15,7 +15,7 @@ apptainer build --force ./carbonara.sif ./carbonara.def
 You can run the container using the following command:
 
 ```
-apptainer run --nv \                                                                                                                Py base singer@SV-55L-004 18:01:35
+apptainer run --nv \                                                                                                               
   --bind "$(pwd)":/data \
   carbonara.sif \
   --num_sequences 10 \
