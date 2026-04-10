@@ -1,45 +1,11 @@
-# Protein Design Containers - copy paste along
+# Protein Design Containers
+
 
 ## Step 1
 
-Ssh onto your HPC
-
-EPFL
-```
-ssh user@kuma.hpc.epfl.ch
-```
-
-ETHZ
-```
-ssh user@euler.ethz.ch
-```
-## Step 2 Reqeust an interactive session
-
-EPFL
-```
-Sinteract -p l40s  -g gpu:1
-```
-
-ETHZ
-```
-srun –pty –gpus=1 bash
-```
-
-## Step 3 Download the apptainer in a directory
-```
-wget https://filesender.switch.ch/filesender2/download.php?token=61a618dd-f3dc-456f-88b6-3372e4c3c708&files_ids=1209911
-
-```
 
 
-## Step 4 Download an example file
-```
-wget https://files.rcsb.org/view/6VF2.pdb 
-
-```
-
-
-## Step 5 Run the Carbonara apptainer 
+## Example command on how to run CARBonAra 
 
 ```
 apptainer run --nv\
@@ -48,4 +14,3 @@ apptainer run --nv\
 --imprint_ratio 0.5 /data/<name of input file>.pdb /data/output
 
 ```
-
