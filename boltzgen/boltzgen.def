@@ -1,0 +1,90 @@
+Bootstrap: docker
+From: nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+%environment
+    export PATH=/opt/venv/bin:$PATH
+    export PYTHONUNBUFFERED=1
+    export CUDA_HOME=/usr/local/cuda
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:$LD_LIBRARY_PATH
+    export HF_HOME=/workspace/.cache/huggingface
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=Europe/Zurich
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common curl git tzdata && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    python3.12 -m venv /opt/venv
+    /opt/venv/bin/pip install --upgrade pip
+
+    # 1. Pin numpy and numba with matching llvmlite FIRST
+    /opt/venv/bin/pip install \
+        "numpy==2.0.2" \
+        "numba==0.61.0" \
+        "llvmlite==0.44.0"
+
+    # 2. Pin torch cu118 for driver 12080 compatibility
+    /opt/venv/bin/pip install \
+        "torch==2.4.1+cu118" \
+        "torchvision==0.19.1+cu118" \
+        "torchaudio==2.4.1+cu118" \
+        "triton==3.0.0" \
+        --index-url https://download.pytorch.org/whl/cu118
+
+    # 3. Pin nvidia-cublas-cu12 to CUDA 12.1 version — prevent upgrade to 12.5+
+    /opt/venv/bin/pip install "nvidia-cublas-cu12==12.1.3.1"
+
+    # 4. Pin ALL cuequivariance packages together at 0.1.0 — avoid cuBLAS 12.5 requirement
+    /opt/venv/bin/pip install \
+        "cuequivariance==0.1.0" \
+        "cuequivariance_torch==0.1.0" \
+        "cuequivariance_ops_torch_cu12==0.1.0"
+
+    # 5. Install boltzgen without deps to protect all pins above
+    /opt/venv/bin/pip install boltzgen==0.3.1 --no-deps
+
+    # 6. Install remaining boltzgen deps explicitly
+    /opt/venv/bin/pip install \
+        "pytorch-lightning==2.4.0" \
+        biopython \
+        biotite \
+        biotraj \
+        "hydra-core==1.3.2" \
+        omegaconf \
+        rdkit \
+        gemmi \
+        pdbeccdutils \
+        matplotlib \
+        pandas \
+        scipy \
+        scikit-learn \
+        huggingface_hub \
+        requests \
+        tqdm \
+        einops \
+        einx \
+        typer \
+        rich \
+        mashumaro \
+        msgpack \
+        pyyaml \
+        edit_distance \
+        hydride \
+        logomaker \
+        pydssp
+
+    # 7. Register all new shared libraries
+    ldconfig
+
+%runscript
+    exec boltzgen "$@"
+
+%labels
+    Author singer
+    Version 2.0
+    Description BoltzGen 0.3.1, PyTorch cu118, CUDA 12.1 base, cuEquivariance 0.1.0
