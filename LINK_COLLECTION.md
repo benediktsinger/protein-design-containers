@@ -38,4 +38,4 @@ Feel free to submit  a PR in case you think somehting important is missing! This
 
 #### Propietary models (Fun to play around with but useless)
 - **Latent Labs** (fully integrated pipeline - binders, mabs): https://www.latentlabs.bio/
-- **Tamarind Bio** (per-by-use API system): https://www.tamarind.bio/
+- **Tamarind Bio** (pay-per-use API system): https://www.tamarind.bio/
