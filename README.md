@@ -14,9 +14,11 @@ A collection of Apptainer (`.def`) and Docker (`Dockerfile`) container definitio
 | [Chai/](Chai/) | Chai-1 | Structure prediction (proteins, ligands, DNA, RNA) |
 | [esm/](esm/) | ESM2 | Protein language model embeddings and folding |
 | [LigandMPNN/](LigandMPNN/) | LigandMPNN | Inverse folding with ligand/DNA context |
+| [RFD4-Proteina/](RFD4-Proteina/) | RFD4-Proteina | Joint sequence+structure design: binders, antibodies, enzymes, pockets |
 | [RFDiffusion3/](RFDiffusion3/) | RFdiffusion3 | Diffusion-based all-atom biomolecular design |
 
-See [LINK_COLLECTION.md](LINK_COLLECTION.md) for online demos and further tools not yet containerised here.
+See [LINK_COLLECTION.md](LINK_COLLECTION.md) for online demos and further tools not yet
+containerised here.
 
 ## How to Get the Already Built Containers
 
@@ -53,6 +55,17 @@ singularity build <tool>.sif docker-daemon://<tool>:latest
 ### Notes
 
 - All containers require an NVIDIA GPU (`--nv` / `--gpus all`).
+- **Check both the driver and the GPU architecture before running on a cluster.** These are
+  separate constraints and they fail differently:
+  - The **driver** caps the CUDA major version. A CUDA 13 image on a CUDA 12.x driver dies
+    at CUDA init with `The NVIDIA driver on your system is too old`, before anything looks
+    at the GPU. Minor versions are forward compatible; major versions are not.
+  - The **architecture** must be covered by the image's compiled arch list, or model init
+    fails with `CUDA error: no kernel image is available for execution on the device`.
+    CUDA 13 dropped Volta, and CUDA 12.6 has no Blackwell kernels.
+
+  A container self-test catches neither, since it does not touch the driver. This is why
+  RFD4-Proteina ships as two images; see [RFD4-Proteina/README.md](RFD4-Proteina/README.md).
 - AlphaFold 3 weights must be requested separately — see [AlphaFold3/README.md](AlphaFold3/README.md).
 - BoltzGen and ESM2 download model weights automatically on first run.
 
@@ -70,6 +83,7 @@ This repository contains Apptainer/Docker container definitions that package thi
 | CARBonAra | CC BY-NC-SA 4.0 | https://github.com/ideaslabut/CARBonAra |
 | ESM2 | MIT | https://github.com/facebookresearch/esm |
 | LigandMPNN | MIT | https://github.com/dauparas/LigandMPNN |
+| RFD4-Proteina | BSD 3-Clause | https://github.com/RosettaCommons/RFD4-Proteina |
 | RFdiffusion3 | BSD 3-Clause | https://github.com/RosettaCommons/RFdiffusion |
 
 The container build scripts in this repository are provided as-is. Users are responsible for complying with the licenses of all bundled software, including any non-commercial restrictions (e.g. AlphaFold 3 and CARBonAra are CC BY-NC-SA 4.0).

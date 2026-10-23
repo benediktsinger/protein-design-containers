@@ -1,0 +1,4 @@
+# Site-specific material: cluster paths, account codes, partition names and job scripts
+# for our own machines. Deliberately not published — this repo is public and holds only
+# portable container definitions.
+local/

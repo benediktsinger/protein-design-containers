@@ -1,0 +1,405 @@
+# RFD4-Proteina — Apptainer definition.
+#
+# Mirrors the upstream Dockerfile (RosettaCommons/RFD4-Proteina) rather than inventing a
+# recipe, with these deliberate changes for running on a shared HPC cluster:
+#   1. weights are baked in at build time    (compute nodes are treated as offline)
+#   2. BOTH Hub revisions are cached         (the shipped config pins a commit that is not
+#                                             `main`; caching only `main` yields an image
+#                                             that imports fine and dies on first generate)
+#   3. a CCD mirror is baked in              (needed for anything involving ligands)
+#   4. a /data symlink farm                  (makes the DATA_PATH fallback resolve too)
+#   5. every cache is redirected to /tmp     (the image is read-only on a compute node)
+#   6. no CUDA base image                    (upstream: the Torch wheels carry the CUDA libs)
+#
+# ONE definition, two images. Pick the accelerator at build time:
+#
+#   apptainer build --fakeroot --build-arg RFD4_ACCELERATOR=cu12 rfd4-proteina-cu12.sif rfd4-proteina.def
+#   apptainer build --fakeroot --build-arg RFD4_ACCELERATOR=cu13 rfd4-proteina-cu13.sif rfd4-proteina.def
+#
+# Which one you need is decided by the DRIVER as much as by the GPU, and that is the single
+# easiest thing to get wrong. There are three independent gates:
+#
+#   1. Driver major version. The driver caps the CUDA major version. CUDA *minor* versions
+#      are forward compatible, major versions are not. A cu13 image on a CUDA 12.x driver
+#      (560 series or earlier) aborts at CUDA init with
+#        RuntimeError: The NVIDIA driver on your system is too old (found version 12060)
+#      This happens before anything looks at the GPU model, and a container self-test that
+#      only imports torch will NOT catch it. CUDA 13 needs a 580-series driver.
+#   2. Compiled arch list. The device's compute capability must be covered by
+#      torch.cuda.get_arch_list(), allowing that a cubin for sm_X.y runs on sm_X.z when
+#      z >= y. Measured here: cu12 gives sm_50 60 70 75 80 86 90; cu13 gives
+#      sm_75 80 86 90 100 120. So Blackwell (sm_100/sm_120) needs cu13, and because CUDA 13
+#      dropped Volta, sm_70 needs cu12. Note cu13 lists no sm_89 at all, yet runs fine on an
+#      sm_89 card via the minor-version rule, so never test for literal list membership.
+#   3. Attention kernels. Even with 1 and 2 satisfied, Volta fails inside the model with
+#        RuntimeError: Invalid backend   at F.scaled_dot_product_attention
+#      because neither flash nor memory-efficient attention exists below sm_80. Only a real
+#      forward pass finds this, so V100-class hardware cannot run RFD4-Proteina at all.
+#
+# Measured: both images build in ~5.5 min and come out at ~13 GiB, of which 9.1 GiB is
+# weights (unique blobs across two Hub revisions) and 0.5 GiB the CCD mirror.
+#
+# Build notes for an unprivileged cluster account:
+#   * `--fakeroot` can work even when `grep $USER /etc/subuid` is empty, because Apptainer
+#     1.4 falls back to a single-uid user-namespace mapping, enough for apt and pip.
+#   * Do NOT add `--ignore-fakeroot-command`. With it, apt's http method cannot setgroups
+#     and every package download fails with
+#       Method gave invalid 400 URI Failure message: Failed to setgroups
+#     A plain `apptainer build` with no `--fakeroot` fails the same way.
+#   * Do NOT bootstrap from Alpine or any musl base. Apptainer's injected fakeroot helper is
+#     glibc-linked and dies with
+#       exec /.singularity.d/libs/fakeroot failed: a shared library is likely missing
+#   * Build in a job on node-local scratch, then move the finished SIF to shared storage.
+#     Building directly on a shared filesystem is slow and can hit stale reads.
+
+BootStrap: docker
+From: python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c
+
+%labels
+    Maintainer  Benedikt Singer
+    Tool        RFD4-Proteina
+    Upstream    https://github.com/RosettaCommons/RFD4-Proteina
+    Weights     https://huggingface.co/nvidia/RFD4-Proteina
+    Accelerator {{ RFD4_ACCELERATOR }}
+    License     BSD-3-Clause
+
+%help
+    RFD4-Proteina: joint sequence+structure generative design (monomers, binders,
+    antibodies/nanobodies, enzymes, small-molecule pockets).
+
+    Model weights and a full CCD mirror are baked into this image, so no network access is
+    needed at run time.
+
+      apptainer exec --nv \
+        -B /path/to/inputs:/inputs:ro -B /path/to/outputs:/outputs \
+        rfd4-proteina-cu13.sif \
+        rfd4-generate inputs=/inputs/binder.cif num_replicates=2 out_dir=/outputs '~metrics'
+
+    Keep '~metrics' unless you have also staged the OpenFold3/AF2 refolding oracles; they
+    are NOT in this image (~24-49 GiB on their own) and scoring has nothing to run without
+    them. Do not combine '~metrics' with inference_experiment=quickstart: that experiment
+    has no `metrics` entry in its defaults list, so Hydra aborts with
+    "Could not delete 'metrics'. No match in the defaults list".
+
+%environment
+    # --- upstream Dockerfile ENV block, kept identical ---
+    export DATA_PATH=/data
+    export HF_HOME=/opt/rfd4/cache/huggingface
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+    export PYTHONNOUSERSITE=1
+    export TMOL_DISABLE_WHEEL_FETCH=1
+    export TMOL_JIT_FALLBACK=0
+    export TMOL_USE_JIT=0
+
+    # --- additions for offline cluster use ---
+    # The DIRECTORY, never the .cif file itself: pointing this at components.cif raises
+    # NotADirectoryError inside atomworks.
+    export CCD_MIRROR_PATH=/opt/ccd_mirror
+    # No PDB mirror is baked in (a full one is far too large for a container). Set
+    # PDB_MIRROR_PATH yourself and bind-mount it if you need to resolve inputs by PDB ID;
+    # it is unnecessary when you pass your own CIF or YAML. atomworks prints a notice about
+    # it at startup either way, and the notice is harmless.
+    # Weights are already in HF_HOME. Staying offline means a compute node never has to
+    # reach huggingface.co, and a missing file fails loudly instead of silently downloading
+    # several GB into a job. Unset it if you deliberately want to pull something new.
+    export HF_HUB_OFFLINE=1
+
+    # The SIF is read-only and $HOME may be unwritable (or shared, which is worse: two
+    # concurrent jobs then race on the same Inductor cache). torch.compile, Triton and
+    # matplotlib all insist on writing, so point them at node-local /tmp.
+    export XDG_CACHE_HOME=/tmp/rfd4-cache
+    export TRITON_CACHE_DIR=/tmp/rfd4-cache/triton
+    export TORCHINDUCTOR_CACHE_DIR=/tmp/rfd4-cache/inductor
+    export CUDA_CACHE_PATH=/tmp/rfd4-cache/nv
+    export MPLCONFIGDIR=/tmp/rfd4-cache/mpl
+    export HF_HUB_DISABLE_PROGRESS_BARS=1
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+    export HF_HOME=/opt/rfd4/cache/huggingface
+
+    # Set by `--build-arg RFD4_ACCELERATOR=cu12|cu13`; there is no default on purpose, so a
+    # build cannot silently produce the wrong one for the target machine's driver.
+    RFD4_ACCELERATOR={{ RFD4_ACCELERATOR }}
+    UV_MIN_VERSION=0.13.4
+    RFD4_VERSION=0.0.3
+
+    # build-essential: torch.compile (Inductor/Triton) compiles C++/CUDA glue at RUN time,
+    # inside the container, so the toolchain has to ship in the image.
+    # libxrender1/libx11-6/libxext6: runtime dependencies of OpenBabel.
+    # ca-certificates: newest bundle the distro offers.
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        build-essential \
+        libxrender1 \
+        libx11-6 \
+        libxext6
+    rm -rf /var/lib/apt/lists/*
+
+    # Bootstrap trust, carried over from upstream (eMudhra/emSign CA incident, Oct 2026):
+    # the pip in the pinned base image bundles a certifi that still trusts the compromised
+    # CA, and pip trusts its bundled certifi in ADDITION to the system store. The base image
+    # is pinned by digest, so its pip never changes on rebuild. Installing the fixed pip from
+    # a hash-pinned URL means this one download is verified by checksum, not by the old trust
+    # store. Remove once the base image ships pip >= 26.2.2.
+    python -m pip install --no-cache-dir \
+        "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+    python -m pip install --no-cache-dir "uv>=${UV_MIN_VERSION}"
+
+    # certifi floor, so nothing in the resolution can drag in a copy that trusts the
+    # compromised CA. It is a constraint, not a requirement: it adds no package by itself.
+    printf 'certifi>=2026.10.19\n' > /tmp/rfd4-constraints.txt
+
+    mkdir -p /opt/rfd4 /data "${HF_HOME}"
+
+    # TMol and its operator wheels must come from published binaries, never a source build.
+    case "${RFD4_ACCELERATOR}" in
+        cu13) EXTRA="all-cuda13"; TORCH_BACKEND="cu130" ;;
+        cu12) EXTRA="all-cuda12"; TORCH_BACKEND="cu126" ;;
+        *) echo "RFD4_ACCELERATOR must be cu13 or cu12" >&2; exit 2 ;;
+    esac
+
+    uv pip install --system --no-cache --no-sources \
+        -c /tmp/rfd4-constraints.txt \
+        --only-binary tmol,tmol-ops-cu12,tmol-ops-cu13 \
+        --torch-backend "${TORCH_BACKEND}" \
+        "rfd4-proteina[${EXTRA}]==${RFD4_VERSION}"
+    rm -f /tmp/rfd4-constraints.txt
+
+    python -m pip check
+    uv --version
+    python -m pip --version
+
+    # BioIR (inference_backend=bioir) ships with the all-cuda13 extra only. Import it at
+    # build time so a broken wheel fails the build instead of the first job.
+    if [ "${RFD4_ACCELERATOR}" = "cu13" ]; then
+        python -c "from bionemo_ir._torch.layers.transformers.blocks import ConditionedTransformerBlock, PairUpdateBlock, with_cuda_graph"
+    fi
+
+    # --- bake the weights ---
+    # The HF repo is 96.8 GiB, but 89.8 GiB of that is prebuilt runtime images we do not
+    # want inside another container: alphafold2/ (49.2 GiB) and openfold3/ (23.5 GiB) are
+    # the optional refolding oracles, and runtime/ (17.1 GiB) is NVIDIA's own prebuilt
+    # rfd4 .sif/.sqsh — i.e. this image's alternative, not its content. Excluding all three
+    # leaves ~7.0 GiB of actual checkpoints.
+    #
+    # Do NOT write this as `hf download REPO --exclude "a/*" "b/*" "c/*"`. The CLI's
+    # --exclude takes ONE value and the rest become positional FILENAMES, i.e. an allow
+    # list — so that form downloads precisely the directories you meant to skip and none
+    # of the weights. It warns ("Ignoring --exclude since filenames have been explicitly
+    # set") and exits 0, so it looks like success. Use the API, where the argument is named.
+    python - <<'PYWEIGHTS'
+import os, re
+from huggingface_hub import snapshot_download
+
+REPO = "nvidia/RFD4-Proteina"
+IGNORE = ["alphafold2/*", "openfold3/*", "runtime/*", "assets/*"]
+
+# `main` first: it carries inference.yaml, the examples and the docs.
+main_path = snapshot_download(REPO, ignore_patterns=IGNORE, max_workers=8)
+print("main snapshot:", main_path)
+
+# The shipped inference.yaml PINS the Hub commit it loads weights from, and that pin is NOT
+# the current `main`. Caching only `main` therefore produces an image that imports fine and
+# then dies on first generate, because HF_HUB_OFFLINE=1 cannot resolve the pinned revision.
+# Read the pin out of the config we just downloaded and cache that revision too, rather than
+# hardcoding a hash here that would silently rot when upstream bumps it. Blobs are shared
+# between revisions in the HF cache, so unchanged weights cost nothing twice.
+cfg = os.path.join(main_path, "inference.yaml")
+rev = None
+if os.path.exists(cfg):
+    for line in open(cfg):
+        m = re.match(r"^\s*hf_ckpt_revision:\s*([0-9a-f]{40})\b", line)
+        if m:
+            rev = m.group(1)
+            break
+
+if rev and not main_path.rstrip("/").endswith(rev):
+    pinned = snapshot_download(REPO, revision=rev, ignore_patterns=IGNORE, max_workers=8)
+    print("pinned snapshot:", pinned)
+else:
+    print("no separate pinned revision to fetch (pin:", rev, ")")
+PYWEIGHTS
+
+    # Assert the download is the shape we asked for. The --exclude bug above was silent, so
+    # check both directions: the weights must be present and the giant runtimes must not be.
+    python - <<'PYVERIFY'
+import os, re, glob
+HUB = "/opt/rfd4/cache/huggingface/hub/models--nvidia--RFD4-Proteina"
+snaps = sorted(glob.glob(os.path.join(HUB, "snapshots", "*")))
+assert snaps, "no snapshot was cached at all"
+print("cached revisions:", [os.path.basename(s) for s in snaps])
+
+required = [
+    "flow_checkpoints/rfd4_proteina_flow-ema.ckpt",
+    "ae_checkpoints/rfd4_proteina_ae-ema.ckpt",
+    "base/model.safetensors",
+    "adapter/adapter_model.safetensors",
+]
+
+# The revision the shipped config will actually ask for must be the one that carries the
+# weights, otherwise the image fails on first generate under HF_HUB_OFFLINE=1.
+pin = None
+for s in snaps:
+    cfg = os.path.join(s, "inference.yaml")
+    if os.path.exists(cfg):
+        for line in open(cfg):
+            m = re.match(r"^\s*hf_ckpt_revision:\s*([0-9a-f]{40})\b", line)
+            if m:
+                pin = m.group(1)
+                break
+    if pin:
+        break
+print("config pins revision:", pin)
+
+if pin:
+    target = os.path.join(HUB, "snapshots", pin)
+    assert os.path.isdir(target), (
+        f"config pins revision {pin} but it is not cached; HF_HUB_OFFLINE=1 will fail at "
+        f"model load. Cached: {[os.path.basename(s) for s in snaps]}")
+    missing = [r for r in required if not os.path.exists(os.path.join(target, r))]
+    assert not missing, f"pinned revision {pin} is missing weights: {missing}"
+
+# Every cached revision must carry the weights and none of the excluded runtimes.
+for s in snaps:
+    miss = [r for r in required if not os.path.exists(os.path.join(s, r))]
+    assert not miss, f"revision {os.path.basename(s)} is missing weights: {miss}"
+    bad = [d for d in ("alphafold2", "openfold3", "runtime")
+           if glob.glob(os.path.join(s, d, "**", "*.s*"), recursive=True)]
+    assert not bad, f"excluded runtimes were downloaded anyway: {bad}"
+
+# Size the blob store, not the snapshots: snapshots are symlink farms and revisions share
+# blobs, so summing per-snapshot would double-count what the two revisions have in common.
+blobs = os.path.join(HUB, "blobs")
+total = sum(os.path.getsize(os.path.join(blobs, f)) for f in os.listdir(blobs))
+gib = total / 2**30
+print(f"baked weights (unique blobs): {gib:.2f} GiB")
+assert 4.0 < gib < 25.0, f"weight payload {gib:.2f} GiB is outside the expected range"
+PYVERIFY
+
+    # --- CCD mirror ---
+    # atomworks (the structure layer under RFD4) needs the Chemical Component Dictionary to
+    # build residue and ligand templates. Without it, generation runs all the way through
+    # diffusion and then dies in structure export with
+    #   ValueError: Cannot load CCD component 'SER': not found in local mirror
+    #
+    # It must be the EXPLODED RCSB layout, not a single components.cif. atomworks resolves
+    # a code as <root>/<code[0]>/<code>/<code>.cif (see atomworks/io/utils/ccd.py,
+    # _get_ccd_path), and its mirror scan only counts codes matching that shape. Handing it
+    # the concatenated components.cif gives a mirror it reports as EMPTY, which is a
+    # different failure from pointing CCD_MIRROR_PATH at the file itself (that raises
+    # NotADirectoryError). Both traps are real.
+    #
+    # So: stream the gzipped dictionary, split it on `data_` block boundaries, and write one
+    # file per component. ~500 MB and ~51k components, which squashfs handles fine.
+    mkdir -p /opt/ccd_mirror
+    python - <<'PYCCD'
+import gzip, io, os, urllib.request
+
+URL = "https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz"
+ROOT = "/opt/ccd_mirror"
+
+codes = []
+code, buf = None, []
+
+def flush():
+    if code is None:
+        return
+    d = os.path.join(ROOT, code[0], code)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, code + ".cif"), "w") as fh:
+        fh.writelines(buf)
+    codes.append(code)
+
+with urllib.request.urlopen(URL, timeout=900) as resp:
+    with gzip.GzipFile(fileobj=resp) as gz:
+        for line in io.TextIOWrapper(gz, encoding="utf-8", errors="replace"):
+            if line.startswith("data_"):
+                flush()
+                code, buf = line[5:].strip(), [line]
+            elif code is not None:
+                buf.append(line)
+flush()
+
+print(f"CCD mirror: {len(codes)} components under {ROOT}")
+assert len(codes) > 30000, f"only {len(codes)} components; the split or download went wrong"
+
+# Pre-compute the code list atomworks looks for, so every job skips a 51k-entry directory
+# walk at startup. It is only honoured when it is NEWER than the mirror root, and creating
+# the subdirectories just bumped the root's mtime, so stamp it deliberately into the future.
+cache = os.path.join(ROOT, ".ccd_codes_cache")
+with open(cache, "w") as fh:
+    fh.write("\n".join(sorted(codes)) + "\n")
+future = os.path.getmtime(ROOT) + 60
+os.utime(cache, (future, future))
+
+# Prove the lookup path works for the residues that actually broke the first run.
+for probe in ("SER", "HIS", "ALA", "HEM"):
+    want = os.path.join(ROOT, probe[0], probe, probe + ".cif")
+    assert os.path.exists(want), f"expected mirror entry missing: {want}"
+print("CCD probes OK: SER HIS ALA HEM")
+PYCCD
+
+    # --- make the DATA_PATH fallback work too ---
+    # inference.yaml resolves weights two ways, and only one of them is the Hub:
+    #   hf_ckpt_path: nvidia/RFD4-Proteina   (wins when set, which it is by default)
+    #   ckpt_path:    ${oc.env:DATA_PATH}/flow_checkpoints
+    #   ckpt_name:    rfd4-proteina-flow-release-2026-10-19.ckpt
+    # The second path wants the ORIGINAL release filenames, which differ from how the Hub
+    # stores them (`flow_checkpoints/rfd4_proteina_flow-ema.ckpt`). release-checkpoints.json
+    # carries that mapping, so build the symlink farm from it instead of hardcoding names
+    # that would rot at the next release.
+    python - <<'PYDATA'
+import json, os, glob
+HUB = "/opt/rfd4/cache/huggingface/hub/models--nvidia--RFD4-Proteina"
+snaps = sorted(glob.glob(os.path.join(HUB, "snapshots", "*")))
+src = next((s for s in snaps if os.path.exists(os.path.join(s, "release-checkpoints.json"))), None)
+if not src:
+    print("no release-checkpoints.json; skipping the DATA_PATH farm")
+    raise SystemExit(0)
+
+meta = json.load(open(os.path.join(src, "release-checkpoints.json")))
+n = 0
+for stored, info in meta.get("checkpoints", {}).items():
+    release_name = info.get("source")
+    target = os.path.join(src, stored)
+    if not release_name or not os.path.exists(target):
+        continue
+    dest_dir = os.path.join("/data", os.path.dirname(stored))
+    os.makedirs(dest_dir, exist_ok=True)
+    for name in (release_name, os.path.basename(stored)):
+        link = os.path.join(dest_dir, name)
+        if not os.path.lexists(link):
+            os.symlink(os.path.realpath(target), link)
+            n += 1
+print(f"DATA_PATH farm: {n} symlinks under /data")
+PYDATA
+
+    # Make the baked data world-readable: it is written here as root, but every job reads
+    # it as an ordinary user.
+    chmod -R a+rX /opt/rfd4 /opt/ccd_mirror /data
+    find /opt/rfd4 /opt/ccd_mirror -type d -exec chmod a+x {} +
+
+    du -sh "${HF_HOME}" /opt/ccd_mirror || true
+
+%test
+    # Deliberately GPU-free: `apptainer build` may run %test on a node whose GPU is not
+    # visible, and a build must not fail for that. Note the consequence — a passing %test
+    # says NOTHING about whether the driver on a given machine can run this image. Only a
+    # real job does. See the three gates in the header.
+    set -e
+    python -c "import torch, rfd4_proteina; print('torch', torch.__version__)"
+    python -c "import torch; print('compiled archs:', torch.cuda.get_arch_list())"
+    command -v rfd4-generate
+    echo "RFD4_PROTEINA_SELFTEST_OK"
+
+%runscript
+    # `apptainer run` goes straight to the generator; use `apptainer exec` for a shell
+    # or for any other entry point.
+    if [ "$#" -eq 0 ]; then
+        exec rfd4-generate --help
+    fi
+    exec rfd4-generate "$@"
