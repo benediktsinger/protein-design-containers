@@ -186,6 +186,15 @@ candidates were scored to produce that one accepted design.
 Three trajectories is a container check, **not** a production campaign. The accepted design
 has not been tested against anything, and nine of the ten candidates were filtered out.
 
+**Budget trajectories, not designs.** Across twelve short campaigns against this target
+under `--core benchmark`, **4 designs were accepted from 36 trajectories** — roughly one in
+nine, and seven of the twelve campaigns accepted nothing at all. A short run that ends with
+`0 accepted design(s)` is therefore the *likely* outcome, not a fault: upstream's own
+`pdl1.json` asks for 10 designs and the shipped IL-2 example allows 60 trajectories for 5.
+Set `max_trajectories` to something like ten times the designs you want, and treat a
+campaign that accepts nothing within a handful of trajectories as uninformative rather than
+as evidence about the image or the target.
+
 The campaigns behind the cuDNN table above were run at the same time; between them they are
 what found that defect.
 
