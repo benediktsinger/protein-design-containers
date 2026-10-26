@@ -51,18 +51,20 @@ a diff with no information in it.
 
 ### Does the newer torch move the numbers?
 
-On the one structure upstream ships, no. The `cu13` image (torch 2.14.1+cu130) was run on an
+No more than the GPU itself does. The `cu13` image (torch 2.14.1+cu130) was run on an
 **RTX PRO 6000 Blackwell (sm_120, driver 580)** against upstream's own `1csl_designs.fasta`:
 
 | Record | cu13 on Blackwell vs upstream's reference |
 |---|---|
-| `seq_wt` | **Exact**, 28/28 nt. |
-| `seq_0` | **Exact**, 28/28 nt — including the last position, the one a `cu12` GPU run flipped. |
+| `seq_wt` | **Exact**, 28/28 nt, both runs. |
+| `seq_0` | 28/28 on the first run, **27/28 on the second** — one position, same as a `cu12` GPU run did. |
 
-That is upstream's torch 2.3.1+cu121 result reproduced byte for byte by a torch 2.14 build
-on a GPU generation that did not exist when the model was published. It is reassuring, and
-it is still **one 28-nucleotide structure**. The caveat in the table above stands: run the
-diff on your own structures before publishing from the `cu13` image.
+So a torch 2.14 build on a GPU generation that postdates the model lands on upstream's
+torch 2.3.1+cu121 answer, to within the one position that a near-tied argmax moves anyway.
+Two runs is not a measurement of a rate, and the first one on its own would have read as
+"byte-identical" — which is exactly why this is a CPU comparison in the recipe above. The
+caveat in the build table stands: run the diff on your own structures, on the CPU, before
+publishing from the `cu13` image.
 
 ## How reproducible is the output, really?
 
