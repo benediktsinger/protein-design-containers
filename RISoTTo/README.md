@@ -26,7 +26,7 @@ CUDA 13 build of torch 2.3.1 exists. On an sm_100/sm_120 card it dies at model i
 | Build | What it is |
 |---|---|
 | `cu12` | Exactly upstream's pinned environment, torch 2.3.1. **The faithful build**, and the one to use for anything you intend to publish. |
-| `cu13` | Upstream's requirements with the torch pin removed and a current CUDA 13 torch installed instead. The only way to use Blackwell, and **not a configuration upstream has tested.** |
+| `cu13` | Upstream's requirements with the torch pin removed and a current CUDA 13 torch installed instead. The only way to use Blackwell, and **not a configuration upstream has tested.** Built here on torch 2.14.1+cu130; see [below](#does-the-newer-torch-move-the-numbers) for what it reproduced. |
 
 Why that caveat is more than box-ticking: torch minor releases have changed reduction order
 and default matmul precision before now, and this model *samples* from a probability
@@ -48,6 +48,21 @@ structure**. One structure is not a proof; a difference is a clear warning.
 
 The CPU is not a detail here — see the next section for why comparing on the GPU gives you
 a diff with no information in it.
+
+### Does the newer torch move the numbers?
+
+On the one structure upstream ships, no. The `cu13` image (torch 2.14.1+cu130) was run on an
+**RTX PRO 6000 Blackwell (sm_120, driver 580)** against upstream's own `1csl_designs.fasta`:
+
+| Record | cu13 on Blackwell vs upstream's reference |
+|---|---|
+| `seq_wt` | **Exact**, 28/28 nt. |
+| `seq_0` | **Exact**, 28/28 nt — including the last position, the one a `cu12` GPU run flipped. |
+
+That is upstream's torch 2.3.1+cu121 result reproduced byte for byte by a torch 2.14 build
+on a GPU generation that did not exist when the model was published. It is reassuring, and
+it is still **one 28-nucleotide structure**. The caveat in the table above stands: run the
+diff on your own structures before publishing from the `cu13` image.
 
 ## How reproducible is the output, really?
 

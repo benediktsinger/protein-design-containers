@@ -185,6 +185,23 @@ PYWEIGHTS
     Other modalities: --modality VHH (drop binder_lengths, the scaffold sets the length),
     peptide, antibody. List the shipped targets with `design --list-targets`.
 
+    SET workers_per_gpu=1 UNLESS YOU HAVE CHECKED OTHERWISE. workers_per_gpu defaults to
+    'auto' and packs two workers onto a 48 GB card; attention_backend defaults to 'auto'
+    and picks cuDNN. Both together, the two workers capture cuDNN attention graphs on one
+    device and kill each other:
+
+      JaxRuntimeError: INTERNAL: detail::cuda_graph_end_capture(...) failed with
+      capturing stream has unjoined work ... [executable_name='jit_sequence_design_loss']
+
+    The campaign does not stop -- the surviving worker finishes it at half throughput and
+    the job exits 134. Measured on an L40S: 5 of 7 campaigns lost a worker on the defaults,
+    0 of 2 with workers_per_gpu=1, and 0 of 2 with attention_backend=chunked at two
+    workers. That last one is what identifies the cause: two workers are fine, cuDNN
+    attention from two processes is not.
+
+      bindcraft design campaign.json --set 'workers_per_gpu=1'
+      bindcraft design campaign.json --set 'attention_backend=chunked'
+
     CONFIRM JAX SEES THE CARD BEFORE A LONG CAMPAIGN. JAX warns once and then runs on the
     CPU, which looks like a working job that will never finish:
 

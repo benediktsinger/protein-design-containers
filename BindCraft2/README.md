@@ -61,6 +61,47 @@ Other modalities: `VHH` (drop `binder_lengths` — the scaffold sets the length)
 
 ## Before you start a long campaign
 
+**Two design workers on one GPU crash each other.** This is the first thing to set, and it
+cost five of seven campaigns here before it was found.
+
+`workers_per_gpu` defaults to `auto`, which packs as many workers onto a card as its free
+memory allows — two on a 48 GB L40S. `attention_backend` also defaults to `auto`, which
+probes cuDNN with a tiny attention, finds it works, and selects it. Put those two defaults
+together and both worker processes capture cuDNN attention graphs on the same device, where
+they fail each other with:
+
+```
+jax.errors.JaxRuntimeError: INTERNAL: detail::cuda_graph_end_capture(fake_stream, &graph_obj)
+failed with capturing stream has unjoined work
+  ... cuda_dnn.cc: 'graph.deserialize(...)'  [executable_name='jit_sequence_design_loss']
+```
+
+The campaign does **not** stop. The surviving worker carries on and the campaign can still
+finish and accept designs — it just does so at half throughput, and exits non-zero (134,
+SIGABRT) at the end. The dead worker is reported in one line of the campaign log and the
+traceback goes to `results/workers/<pid>_worker_NN_gpu_0.log`, so a job that looks like it
+merely "failed at the end" has in fact been running at half speed for hours.
+
+Measured on an L40S over seven campaigns, same target and settings:
+
+| Configuration | Workers on the card | Campaigns that lost a worker |
+|---|---|---|
+| `workers_per_gpu=auto`, `attention_backend=auto` (**the defaults**) | 2 | **5 of 7** |
+| `workers_per_gpu=1` | 1 | 0 of 2 |
+| `attention_backend=chunked`, workers still `auto` | 2 | 0 of 2 |
+
+The third row is the one that identifies the cause: two workers on one GPU are **fine** as
+long as they are not both using cuDNN attention. So pick by what you are short of:
+
+```
+bindcraft design campaign.json --set 'workers_per_gpu=1'       # safe, half the throughput
+bindcraft design campaign.json --set 'attention_backend=chunked'  # keeps both workers, slower kernels
+```
+
+`BINDCRAFT_WORKERS_PER_GPU=1` in the environment does the same as the first. The failure is
+not deterministic — two of seven runs survived the defaults untouched — so a campaign that
+once worked is not evidence that the defaults are safe.
+
 **Confirm JAX actually sees the card.** JAX warns once and then runs on the CPU, which looks
 exactly like a working job that will never finish:
 
@@ -126,8 +167,31 @@ On an L40S (sm_89, 560-series driver / CUDA 12.6), the `cu12` image:
   `hIL7RA`, `hPD1`, `hPDL1`, `mPDL1`);
 - all 15 AlphaFold parameter files are present and full-size.
 
-A full design campaign has **not** been run here — that is hours of GPU time, and it is the
-next thing to do before trusting this image for production work.
+**A full campaign has now been run**, against the shipped `hPDL1` target under `--core
+benchmark`, and it accepted a design on the third trajectory:
+
+| | |
+|---|---|
+| Binder | 163 residues, de novo |
+| `i_pTM` / `pLDDT` / `pTM` | 0.82 / 0.90 / 0.86 |
+| `i_pAE` / `i_pDAE` | 0.21 / 0.31 |
+| Interface | 14 binder residues against 16 target residues, 866 Å² buried |
+| Hotspot contact fraction | **1.0**, with 0.0 off-epitope contact |
+| Clashes | 0 backbone, 7 all-atom |
+
+So the whole workflow runs: AF2 hallucination, ProteinMPNN redesign, re-prediction and
+filtering with held-back models, ranking, and the mmCIF and CSV outputs. Ten redesign
+candidates were scored to produce that one accepted design.
+
+Three trajectories is a container check, **not** a production campaign. The accepted design
+has not been tested against anything, and nine of the ten candidates were filtered out.
+
+The campaigns behind the cuDNN table above were run at the same time; between them they are
+what found that defect.
+
+The `cu13` image has been verified only up to the GPU, on an RTX PRO 6000 Blackwell
+(sm_120, driver 580): `jax.devices()` returns `[CudaDevice(id=0)]`, a matmul and softmax
+compute on the card, and `--list-targets` runs. **No campaign has been run on Blackwell.**
 
 ## Legal Notice
 

@@ -101,8 +101,14 @@ structures from `/opt/PeSTo/pdbs_test`:
 - `pesto-cu12` on the GPU and `pesto-cpu` on the CPU gave **identical b-factors**, largest
   difference 0.0000 over ten output files.
 
-That last point is worth having: it means you can develop on the CPU image and scale up on
-the GPU one without the numbers moving.
+The `cu13` image was then verified the same way on an **RTX PRO 6000 Blackwell (sm_120,
+580-series driver / CUDA 13.0)**, where it reports `torch 2.14.1+cu130` and an arch list of
+`sm_75 sm_80 sm_86 sm_90 sm_100 sm_120`. Against the CPU image on the same two structures,
+the largest b-factor difference was again **0.0000** over ten output files.
+
+That last point is worth having, and it now holds across two GPU generations and two CUDA
+majors: you can develop on the CPU image and scale up on either GPU one without the numbers
+moving.
 
 ## Acknowledgements
 

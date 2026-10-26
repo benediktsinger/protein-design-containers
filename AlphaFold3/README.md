@@ -179,14 +179,36 @@ since triton gemm is not supported there at all.
 ## How good are MMseqs2 alignments here?
 
 Stated plainly: **these are not the alignments AlphaFold 3 was evaluated with.** The
-official pipeline is jackhmmer over roughly 630 GB of genetic databases, which is hours of
-CPU per target. MMseqs2 does a comparable job in minutes.
+official pipeline is jackhmmer over roughly 630 GB of genetic databases. MMseqs2 does a
+comparable job in a fraction of the time.
+
+Both routes have now been run here on the same sequence — ubiquitin, 76 residues — with the
+same weights, on an L40S with 8 CPUs:
+
+| | MMseqs2 route | official pipeline (`AF3_HMMER=yes`) |
+|---|---|---|
+| Database | `pdb_seqres` alone, 230 MB | uniref90 + mgnify + BFD + uniprot, ~620 GB |
+| Alignment | 2,301 hits in **11 s** | 7,964 unpaired sequences in **393 s**, plus 4 templates in 26 s |
+| Inference | 48 s | 138 s |
+| `ranking_score` | 0.84 | **0.85** |
+| `pTM` | 0.84 | **0.85** |
+
+So on this target a 35× deeper MSA moved the confidence by 0.01. That is exactly the result
+the paragraph above predicts, and it is **one easy target**: ubiquitin is about as
+well-covered as a protein gets, and the two are not compared against an experimental
+structure here, only against each other.
 
 Expect well-covered, well-conserved targets to come out much the same. Expect the
 difference to show on shallow families, on orphan sequences, and on anything where the MSA
 was carrying the prediction rather than decorating it. If a result has to be defensible,
 build with `--build-arg AF3_HMMER=yes`, stage the databases with upstream's
 `fetch_databases.sh`, and run the official pipeline.
+
+**Budget CPUs for the official pipeline by multiplying.** AlphaFold runs the four database
+searches *concurrently*, each with `--jackhmmer_n_cpu` threads, so the real demand is four
+times that flag. The default is 8, which is 32 threads — on an 8-CPU allocation that is 4×
+oversubscription, and the 393 s above was measured in exactly that oversubscribed state.
+Either ask for 32 CPUs or set `--jackhmmer_n_cpu` to a quarter of what you have.
 
 The search defaults here are deliberately sensitive: `--num-iterations 3` (an iterative
 profile search, which is what makes MMseqs2 competitive on remote homologues),
