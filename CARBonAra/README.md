@@ -87,9 +87,9 @@ prediction is turned into a sequence. So:
 - `--sampling_method max --num_sequences 10` gives ten **different** sequences, not ten
   copies of one.
 - Re-running the identical command gives different sequences again, on the same hardware.
-- Measured on `examples/2oob.pdb` at the default `imprint_ratio=0.5`: two independent
-  comparisons gave **107/117 (91.5%)** and **109/117 (93.2%)** agreement — eight to ten
-  residues move between runs.
+- Measured on `examples/2oob.pdb` at the default `imprint_ratio=0.5`: three independent
+  pairs of runs agreed at **104/117 (88.9%)**, **107/117 (91.5%)** and **109/117 (93.2%)**
+  — eight to thirteen residues move between runs.
 
 Two settings are deterministic, because they make the random mask irrelevant:
 

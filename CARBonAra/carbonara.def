@@ -202,8 +202,8 @@ PYEOF
     `mm = np.random.rand(n) <= (1 - imprint_ratio)` in imprint_sampling -- and nothing
     seeds numpy. So --sampling_method max gives you N DIFFERENT sequences for
     --num_sequences N, and re-running the same command gives different answers again.
-    Measured on examples/2oob.pdb at the default imprint_ratio=0.5: two independent
-    comparisons agreed at 107/117 (91.5%) and 109/117 (93.2%).
+    Measured on examples/2oob.pdb at the default imprint_ratio=0.5: three independent
+    pairs of runs agreed at 104/117 (88.9%), 107/117 (91.5%) and 109/117 (93.2%).
 
     Two settings are deterministic, because they make that random mask irrelevant:
 
