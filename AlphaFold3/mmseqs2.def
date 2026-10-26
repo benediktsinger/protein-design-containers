@@ -1,0 +1,613 @@
+# MMseqs2 — Apptainer definition, as the MSA stage in front of AlphaFold 3.
+#
+# This is step 1 of a two-step pipeline. It searches a sequence database for homologues of
+# your query and writes one A3M alignment per chain, in the exact shape AlphaFold 3's input
+# JSON wants. Step 2 is alphafold3.sif, which does the folding. See README.md in this
+# folder for the whole run, end to end.
+#
+#   apptainer build --fakeroot mmseqs2.sif mmseqs2.def
+#   apptainer build --fakeroot --build-arg MMSEQS_BUILD=sse41 mmseqs2-sse41.sif mmseqs2.def
+#   apptainer build --fakeroot --build-arg MMSEQS_BUILD=gpu   mmseqs2-gpu.sif   mmseqs2.def
+#
+# WHY NOT JUST USE ALPHAFOLD 3's OWN DATA PIPELINE? Because it is jackhmmer over ~630 GB of
+# databases, which is hours of CPU per target and a storage commitment to match. MMseqs2
+# searches the same kind of data in minutes. What you give up is fidelity: these are not
+# the alignments DeepMind evaluated the model on. Expect well-covered, well-conserved
+# targets to come out much the same, and expect the difference to show on shallow families,
+# on orphan sequences and on anything where the MSA was carrying the prediction. If a
+# result matters, reproduce it with the official pipeline (`--build-arg AF3_HMMER=yes` on
+# the AlphaFold 3 image) before believing it.
+#
+# MMSEQS_BUILD selects which upstream release binary to install, because MMseqs2 ships one
+# tarball per instruction set rather than detecting at run time:
+#
+#   avx2   (default) Any x86_64 server CPU since about 2014. This is the one you want.
+#   sse41            Older x86_64. Noticeably slower; only if avx2 faults with SIGILL.
+#   sse2             Very old x86_64. Slower again.
+#   gpu              The CUDA build. Fast, and NOT a drop-in: a GPU search needs the target
+#                    database converted with `mmseqs makepaddedseqdb` first, and needs an
+#                    sm_80 or newer card. Untested here. See %help before reaching for it.
+#
+# On aarch64 the architecture-specific choice does not apply: the ARM tarball is selected
+# automatically (the GPU ARM tarball when MMSEQS_BUILD=gpu), and MMSEQS_BUILD is otherwise
+# ignored. The binaries are static, so unlike most images in this repository this one does
+# build and run on ARM.
+#
+# NO DATABASE IS INCLUDED. A useful one is tens to hundreds of GB; it belongs on a
+# filesystem, bind-mounted in. `mmseqs databases` inside this image will fetch one for you.
+
+BootStrap: docker
+From: python:3.12.12-slim-bookworm
+
+%arguments
+    MMSEQS_BUILD=avx2
+
+%labels
+    Maintainer  Benedikt Singer
+    Tool        MMseqs2
+    Upstream    https://github.com/soedinglab/MMseqs2
+    Version     18-8cc5c
+    Build       {{ MMSEQS_BUILD }}
+    Purpose     MSA generation for AlphaFold 3
+    License     MIT
+
+%environment
+    export PATH=/opt/mmseqs/bin:$PATH
+    export PYTHONNOUSERSITE=1
+
+    # MMseqs2 writes a lot of temporary data and respects TMPDIR. Node-local by default;
+    # point it at fast local scratch for a real search, never at a network filesystem.
+    export MMSEQS_FORCE_MERGE=1
+
+    # The SIF is read-only and $HOME may be unwritable or shared between concurrent jobs.
+    export XDG_CACHE_HOME=/tmp/mmseqs-cache
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    MMSEQS_BUILD={{ MMSEQS_BUILD }}
+    MMSEQS_VERSION=18-8cc5c
+
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates wget
+    rm -rf /var/lib/apt/lists/*
+
+    # One tarball per instruction set. Resolve the ARM case first: on aarch64 there are
+    # only two choices, so MMSEQS_BUILD only decides CPU versus GPU there.
+    case "$(uname -m)" in
+        aarch64|arm64)
+            case "${MMSEQS_BUILD}" in
+                gpu) ASSET=mmseqs-linux-gpu-arm64.tar.gz ;;
+                *)   ASSET=mmseqs-linux-arm64.tar.gz ;;
+            esac
+            ;;
+        x86_64)
+            case "${MMSEQS_BUILD}" in
+                avx2)  ASSET=mmseqs-linux-avx2.tar.gz ;;
+                sse41) ASSET=mmseqs-linux-sse41.tar.gz ;;
+                sse2)  ASSET=mmseqs-linux-sse2.tar.gz ;;
+                gpu)   ASSET=mmseqs-linux-gpu.tar.gz ;;
+                *) echo "MMSEQS_BUILD must be avx2, sse41, sse2 or gpu (got '${MMSEQS_BUILD}')" >&2; exit 2 ;;
+            esac
+            ;;
+        *) echo "no MMseqs2 release binary for $(uname -m)" >&2; exit 2 ;;
+    esac
+
+    wget -q -O /tmp/mmseqs.tar.gz \
+        "https://github.com/soedinglab/MMseqs2/releases/download/${MMSEQS_VERSION}/${ASSET}"
+    tar -xzf /tmp/mmseqs.tar.gz -C /opt
+    rm /tmp/mmseqs.tar.gz
+    test -x /opt/mmseqs/bin/mmseqs
+
+    # Prove the binary runs on THIS cpu now. A wrong instruction-set choice otherwise
+    # surfaces as an "Illegal instruction" core dump inside somebody's job, which looks
+    # nothing like a packaging mistake. Note this check passes on the build node and tells
+    # you nothing about a different node: if your cluster is heterogeneous, the avx2 build
+    # is the one that is safe to assume.
+    /opt/mmseqs/bin/mmseqs version
+
+    python -m pip install --no-cache-dir --upgrade pip
+
+    # ---------------------------------------------------------------------------------
+    # af3_msa.py — the two helpers, as one module with two entry points.
+    #
+    # Written flush-left on purpose: an indented heredoc body is still indented Python and
+    # raises IndentationError at import, which would only be found by running the image.
+    # ---------------------------------------------------------------------------------
+    mkdir -p /opt/af3-msa
+    cat > /opt/af3-msa/af3_msa.py <<'PYEOF'
+"""MMseqs2 -> A3M -> AlphaFold 3 JSON.
+
+Two entry points:
+
+  search   run an MMseqs2 profile search and write one validated A3M per query sequence
+  json     write an AlphaFold 3 input JSON that points at those A3M files
+
+The validation is the part that earns its keep. AlphaFold 3 requires of a supplied MSA
+that (1) it is A3M, (2) the first sequence is exactly the query, and (3) with all
+insertions removed every row is exactly as long as the query. Violate any of those and the
+failure appears inside featurisation, well after you have queued the folding job, with an
+error that does not name the file. So the A3M is checked here, where it is cheap to fix.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+MMSEQS = os.environ.get("MMSEQS_BIN", "/opt/mmseqs/bin/mmseqs")
+
+
+# --------------------------------------------------------------------------- FASTA / A3M
+
+
+def read_fasta(path):
+    """Return [(header, sequence)], preserving order. Case and gaps are kept as-is."""
+    records = []
+    header = None
+    chunks = []
+    with open(path) as handle:
+        for line in handle:
+            line = line.rstrip("\n\r")
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith(">"):
+                if header is not None:
+                    records.append((header, "".join(chunks)))
+                header = line[1:].strip()
+                chunks = []
+            else:
+                chunks.append(line.strip())
+    if header is not None:
+        records.append((header, "".join(chunks)))
+    return records
+
+
+def ungapped_upper(seq):
+    """The A3M row as AlphaFold sees it: insertions (lowercase) removed, gaps kept."""
+    return "".join(c for c in seq if not c.islower())
+
+
+def safe_name(header, fallback):
+    """A filesystem-safe stem from a FASTA header's first token."""
+    token = header.split()[0] if header.split() else fallback
+    token = token.replace("|", "_").replace("/", "_").replace(":", "_")
+    token = "".join(c for c in token if c.isalnum() or c in "._-")
+    return token or fallback
+
+
+def validate_a3m(path, query_seq, strict=False):
+    """Rewrite path in place so it satisfies AlphaFold 3's three A3M rules.
+
+    Returns (kept, dropped). Rows whose ungapped length does not match the query are
+    dropped, because a single ragged row makes the whole alignment unusable and one
+    bad hit is not worth losing a search over. With strict=True it raises instead.
+    """
+    records = read_fasta(path)
+    if not records:
+        raise ValueError("{}: empty alignment".format(path))
+
+    n = len(query_seq)
+    out = [(">query", query_seq)]
+    kept = 1
+    dropped = 0
+
+    # The first record is the query itself in mmseqs output. Compare on the ungapped
+    # uppercase form, which is what has to match; then drop it, since out[0] already
+    # carries the query verbatim and duplicating it would shift every pairing by a row.
+    first_seq = ungapped_upper(records[0][1]).replace("-", "")
+    if first_seq != query_seq:
+        # Not fatal: it means --skip-query was in play, or the db renamed the query. The
+        # query row is prepended either way, so the alignment stays valid.
+        print("note: {}: first row is not the query; prepending it".format(path),
+              file=sys.stderr)
+        start = 0
+    else:
+        start = 1
+
+    for header, seq in records[start:]:
+        row = ungapped_upper(seq)
+        if len(row) != n:
+            dropped += 1
+            if strict:
+                raise ValueError(
+                    "{}: row {!r} has ungapped length {}, query is {}".format(
+                        path, header[:40], len(row), n))
+            continue
+        out.append((">" + header, seq))
+        kept += 1
+
+    with open(path, "w") as handle:
+        for header, seq in out:
+            handle.write("{}\n{}\n".format(header, seq))
+    return kept, dropped
+
+
+# --------------------------------------------------------------------------------- search
+
+
+def run(cmd):
+    print("+ " + " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+
+
+def cmd_search(args):
+    if not os.path.isfile(args.query):
+        sys.exit("query FASTA not found: {}".format(args.query))
+    queries = read_fasta(args.query)
+    if not queries:
+        sys.exit("no sequences in {}".format(args.query))
+    for header, seq in queries:
+        bad = set(seq) - set("ACDEFGHIKLMNPQRSTVWYXBZUO")
+        if bad:
+            sys.exit("{}: not a protein sequence, unexpected characters: {}".format(
+                header[:40], "".join(sorted(bad))))
+
+    os.makedirs(args.outdir, exist_ok=True)
+    tmp = args.tmpdir or os.path.join(args.outdir, "mmseqs_tmp")
+    work = os.path.join(tmp, "work")
+    os.makedirs(work, exist_ok=True)
+
+    qdb = os.path.join(work, "qdb")
+    resdb = os.path.join(work, "res")
+    msadb = os.path.join(work, "msa")
+    unpacked = os.path.join(work, "unpacked")
+
+    run([MMSEQS, "createdb", args.query, qdb])
+
+    # -a keeps the alignment backtrace, which result2msa needs; without it the MSA step
+    # fails with a message about missing backtraces rather than about the missing flag.
+    search = [
+        MMSEQS, "search", qdb, args.target, resdb, os.path.join(tmp, "search_tmp"),
+        "-a",
+        "--num-iterations", str(args.num_iterations),
+        "-s", str(args.sensitivity),
+        "--max-seqs", str(args.max_seqs),
+        "-e", str(args.evalue),
+        "--threads", str(args.threads),
+    ]
+    search += args.mmseqs_args
+    run(search)
+
+    # --msa-format-mode 5 is plain A3M. Mode 2 is aligned FASTA (no insertion columns, so
+    # it loses information AlphaFold uses), mode 6 adds alignment metadata that AlphaFold
+    # does not parse, and modes 0/1 are binary.
+    run([MMSEQS, "result2msa", qdb, args.target, resdb, msadb,
+         "--msa-format-mode", "5", "--threads", str(args.threads)])
+
+    # Unpack by DB key, then rename from qdb.lookup. Letting mmseqs name files from the
+    # accession (--unpack-name-mode 1) breaks on any header with a slash or a pipe in it.
+    run([MMSEQS, "unpackdb", msadb, unpacked, "--unpack-name-mode", "0"])
+
+    # qdb.lookup is "<key>\t<header>\t<set>", one line per query, in input order. Read the
+    # keys from it rather than assuming key == input index: that happens to be true for a
+    # fresh createdb, but it is not a documented guarantee and a silent off-by-one here
+    # would attach chain B's alignment to chain A.
+    entries = []
+    with open(qdb + ".lookup") as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2:
+                entries.append((parts[0], parts[1]))
+    if len(entries) != len(queries):
+        sys.exit("createdb made {} entries from {} input sequences".format(
+            len(entries), len(queries)))
+
+    written = []
+    for index, ((key, db_header), (header, seq)) in enumerate(zip(entries, queries)):
+        src = os.path.join(unpacked, key)
+        if not os.path.isfile(src):
+            sys.exit("mmseqs produced no MSA for query {} ({})".format(key, header[:40]))
+        stem = safe_name(db_header or header, "chain{}".format(index))
+        dst = os.path.join(args.outdir, stem + ".a3m")
+        shutil.move(src, dst)
+        kept, dropped = validate_a3m(dst, seq, strict=args.strict)
+        print("{}: {} sequences kept, {} dropped as ragged -> {}".format(
+            stem, kept, dropped, dst), flush=True)
+        if kept <= 1:
+            print("WARNING: {} has no homologues at all. AlphaFold will run effectively "
+                  "MSA-free for this chain.".format(stem), file=sys.stderr)
+        written.append((stem, dst, seq))
+
+    if not args.keep_tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        print("temporary MMseqs2 databases left in {}".format(tmp))
+
+    print("\nwrote {} alignment(s) to {}".format(len(written), args.outdir))
+    print("next: af3-msa-json --fasta {} --msa-dir {} --name NAME --out input.json".format(
+        args.query, args.outdir))
+
+
+# ----------------------------------------------------------------------------------- json
+
+
+def cmd_json(args):
+    queries = read_fasta(args.fasta)
+    if not queries:
+        sys.exit("no sequences in {}".format(args.fasta))
+
+    if args.ids:
+        ids = [i.strip() for i in args.ids.split(",") if i.strip()]
+    else:
+        # A, B, ... Z, then AA, AB, ... which is the convention AlphaFold's own examples use.
+        letters = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
+        ids = list(letters)
+        for first in letters:
+            ids += [first + second for second in letters]
+    if args.copies:
+        copies = [int(c) for c in args.copies.split(",")]
+        if len(copies) != len(queries):
+            sys.exit("--copies has {} entries but the FASTA has {} sequences".format(
+                len(copies), len(queries)))
+    else:
+        copies = [1] * len(queries)
+
+    out_dir = os.path.dirname(os.path.abspath(args.out)) or "."
+    sequences = []
+    cursor = 0
+    for index, (header, seq) in enumerate(queries):
+        stem = safe_name(header, "chain{}".format(index))
+        chain_ids = ids[cursor:cursor + copies[index]]
+        cursor += copies[index]
+
+        chain = {"id": chain_ids, "sequence": seq}
+
+        a3m = os.path.join(args.msa_dir, stem + ".a3m") if args.msa_dir else None
+        if a3m and os.path.isfile(a3m):
+            if args.inline:
+                with open(a3m) as handle:
+                    chain["unpairedMsa"] = handle.read()
+            else:
+                # AlphaFold resolves *MsaPath relative to the JSON file's own directory.
+                chain["unpairedMsaPath"] = os.path.relpath(os.path.abspath(a3m), out_dir)
+            # unpairedMsa and pairedMsa must BOTH be set or BOTH be null. Setting one and
+            # omitting the other is rejected outright, so "" is not optional here.
+            chain["pairedMsa"] = ""
+        elif args.msa_free:
+            chain["unpairedMsa"] = ""
+            chain["pairedMsa"] = ""
+        elif a3m:
+            sys.exit("no alignment for {} at {} (use --msa-free to fold without one)".format(
+                stem, a3m))
+
+        chain["templates"] = []
+        sequences.append({"protein": chain})
+
+    document = {
+        "name": args.name,
+        "dialect": "alphafold3",
+        "version": 2,
+        "modelSeeds": [int(s) for s in args.seeds.split(",")],
+        "sequences": sequences,
+    }
+
+    with open(args.out, "w") as handle:
+        json.dump(document, handle, indent=2)
+        handle.write("\n")
+    print("wrote {} ({} chain entries, {} chain ids)".format(
+        args.out, len(sequences), cursor))
+    print("\nFold it with, NOTE both flags:")
+    print("  alphafold3 --json_path={} --model_dir=/models --output_dir=out \\".format(
+        args.out))
+    print("      --norun_data_pipeline --resolve_msa_overlaps=false")
+
+
+# ----------------------------------------------------------------------------------- main
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="af3-msa",
+        description="MMseqs2 MSA generation for AlphaFold 3 (see `af3-msa <cmd> -h`)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("search", help="search a database and write validated A3M files")
+    s.add_argument("query", help="query FASTA (one record per chain)")
+    s.add_argument("target", help="MMseqs2 target database prefix (not a FASTA)")
+    s.add_argument("outdir", help="directory for the .a3m files")
+    s.add_argument("--threads", type=int, default=len(os.sched_getaffinity(0)),
+                   help="default: the CPUs this process is allowed to use")
+    s.add_argument("--num-iterations", type=int, default=3, dest="num_iterations",
+                   help="profile search iterations (default 3; 1 is a plain search)")
+    s.add_argument("--sensitivity", type=float, default=8.0,
+                   help="mmseqs -s (default 8.0, i.e. sensitive and slow)")
+    s.add_argument("--max-seqs", type=int, default=10000, dest="max_seqs",
+                   help="hits kept per query per iteration (default 10000)")
+    s.add_argument("--evalue", type=float, default=0.1,
+                   help="inclusion e-value (default 0.1)")
+    s.add_argument("--tmpdir", default=None,
+                   help="scratch for MMseqs2 (default: <outdir>/mmseqs_tmp). Put this on "
+                        "node-local disk; MMseqs2 is hard on a network filesystem.")
+    s.add_argument("--keep-tmp", action="store_true", dest="keep_tmp",
+                   help="keep the intermediate MMseqs2 databases")
+    s.add_argument("--strict", action="store_true",
+                   help="fail on a ragged alignment row instead of dropping it")
+    s.add_argument("mmseqs_args", nargs="*",
+                   help="extra arguments passed straight to `mmseqs search`")
+    s.set_defaults(func=cmd_search)
+
+    j = sub.add_parser("json", help="write an AlphaFold 3 input JSON")
+    j.add_argument("--fasta", required=True, help="the same query FASTA used for the search")
+    j.add_argument("--msa-dir", default=None, dest="msa_dir",
+                   help="directory holding <stem>.a3m, as written by `search`")
+    j.add_argument("--name", required=True, help="job name recorded in the JSON")
+    j.add_argument("--out", required=True, help="output JSON path")
+    j.add_argument("--seeds", default="1", help="comma-separated model seeds (default 1)")
+    j.add_argument("--ids", default=None,
+                   help="comma-separated chain ids (default A, B, C, ...)")
+    j.add_argument("--copies", default=None,
+                   help="comma-separated copy count per FASTA record, for homomers")
+    j.add_argument("--inline", action="store_true",
+                   help="embed the A3M in the JSON instead of referencing it by path. "
+                        "Makes one self-contained file; also makes a large one.")
+    j.add_argument("--msa-free", action="store_true", dest="msa_free",
+                   help="for chains with no alignment, fold MSA-free instead of failing")
+    j.set_defaults(func=cmd_json)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+
+    python -m py_compile /opt/af3-msa/af3_msa.py
+
+    cat > /usr/local/bin/af3-msa-search <<'SHEOF'
+#!/bin/sh
+exec python3 /opt/af3-msa/af3_msa.py search "$@"
+SHEOF
+    cat > /usr/local/bin/af3-msa-json <<'SHEOF'
+#!/bin/sh
+exec python3 /opt/af3-msa/af3_msa.py json "$@"
+SHEOF
+    cat > /usr/local/bin/af3-msa <<'SHEOF'
+#!/bin/sh
+exec python3 /opt/af3-msa/af3_msa.py "$@"
+SHEOF
+    chmod 755 /usr/local/bin/af3-msa-search /usr/local/bin/af3-msa-json /usr/local/bin/af3-msa
+
+%test
+    set -eu
+    export PATH=/opt/mmseqs/bin:$PATH
+    mmseqs version
+    af3-msa --help > /dev/null
+    af3-msa-search --help > /dev/null
+    af3-msa-json --help > /dev/null
+
+    # A real end-to-end run on a toy database, so the test exercises createdb, search,
+    # result2msa, unpackdb, the rename from the .lookup file, the A3M validator and the
+    # JSON writer. No network and no GPU, so it runs anywhere the image builds.
+    T="$(mktemp -d)"
+    cat > "$T/query.fasta" <<'FAEOF'
+>chainA test query
+MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGCEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWERVMGDGERQFSTLKSTVEAIWAGIKATEAAVSEEFGLAPFLPDQIHFVHSQELLSRYPDLDAKGRERAIAKDLGAVFLVGIGGKLSDGHRHDVRAPDYDDWSTPSELGHAGLNGDILVWNPVLEDAFELSSMGIRVDADTLKHQLALTGDEDRLELEWHQALLRGEMPQTIGGGIGQSRLTMLLLQLPHIGQVQAGVWPAAVRESVPSLL
+FAEOF
+    # The "database" is the query plus two near-identical variants: enough for result2msa
+    # to produce a genuine multi-row A3M, and small enough to search in a second.
+    cat > "$T/target.fasta" <<'FAEOF'
+>hit1
+MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGCEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWERVMGDGERQFSTLKSTVEAIWAGIKATEAAVSEEFGLAPFLPDQIHFVHSQELLSRYPDLDAKGRERAIAKDLGAVFLVGIGGKLSDGHRHDVRAPDYDDWSTPSELGHAGLNGDILVWNPVLEDAFELSSMGIRVDADTLKHQLALTGDEDRLELEWHQALLRGEMPQTIGGGIGQSRLTMLLLQLPHIGQVQAGVWPAAVRESVPSLL
+>hit2
+MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWERVMGDGERQFSTLKSTVEAIWAGIKATEAAVSEEFGLAPFLPDQIHFVHSQELLSRYPDLDAKGRERAIAKDLGAVFLVGIGGKLSDGHRHDVRAPDYDDWSTPSELGHAGLNGDILVWNPVLEDAFELSSMGIRVDADTLKHQLALTGDEDRLELEWHQALLRGEMPQTIGGGIGQSRLTMLLLQLPHIGQVQAGVWPAAVRESVPSLL
+>hit3
+MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGCEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWERVMGDGERQFSTLKSTVEAIWAGIKATEAAVSEEFGLAPFLPDQIHFVHSQELLSRYPDLDAKGRERAIAKDLGAVFLVGIGGKLSDGHRHDVRAPDYDDWSTPSELGHAGLNGDILVWNPVLEDAFELSSMGIRVDADTLKHQLALTGDEDRWELEWHQALLRGEMPQTIGGGIGQSRLTMLLLQLPHIGQVQAGVWPAAVRESVPSLL
+FAEOF
+    mmseqs createdb "$T/target.fasta" "$T/targetdb" > /dev/null
+    af3-msa-search --threads 2 --num-iterations 1 --sensitivity 5.7 \
+        "$T/query.fasta" "$T/targetdb" "$T/msas"
+    test -s "$T/msas/chainA.a3m"
+    af3-msa-json --fasta "$T/query.fasta" --msa-dir "$T/msas" \
+        --name selftest --out "$T/input.json"
+
+    # Assert the JSON is the shape AlphaFold 3 accepts, and the A3M obeys its three rules.
+    python3 - "$T" <<'PYEOF'
+import json
+import sys
+
+root = sys.argv[1]
+with open(root + "/input.json") as handle:
+    doc = json.load(handle)
+
+assert doc["dialect"] == "alphafold3" and doc["version"] == 2, doc
+chain = doc["sequences"][0]["protein"]
+assert chain["pairedMsa"] == "", "pairedMsa must be present and empty"
+assert "unpairedMsaPath" in chain, chain.keys()
+assert chain["templates"] == []
+
+query = chain["sequence"]
+rows = []
+header = None
+with open(root + "/msas/chainA.a3m") as handle:
+    for line in handle:
+        line = line.strip()
+        if line.startswith(">"):
+            header = line
+        elif line and header is not None:
+            rows.append(line)
+
+assert rows, "alignment is empty"
+assert rows[0] == query, "first row is not the query"
+for row in rows:
+    plain = "".join(c for c in row if not c.islower())
+    assert len(plain) == len(query), (len(plain), len(query))
+print("a3m rows:", len(rows), "| json and a3m both valid")
+PYEOF
+    rm -rf "$T"
+    echo "MMSEQS2_TEST_OK"
+
+%runscript
+    exec /opt/mmseqs/bin/mmseqs "$@"
+
+%help
+    MMseqs2 18-8cc5c, packaged as the MSA stage for AlphaFold 3.
+
+    THE TWO-STEP RUN (full worked example in README.md):
+
+      # 1. get a database, once. ~60 GB for UniRef90, and it takes a while.
+      apptainer exec -B /scratch/db:/db mmseqs2.sif \
+          mmseqs databases UniRef90 /db/uniref90 /db/tmp --threads 16
+
+      # 2. search, and write the JSON
+      apptainer exec -B /scratch/db:/db:ro -B "$PWD":/data mmseqs2.sif \
+          af3-msa-search --threads 32 /data/query.fasta /db/uniref90 /data/msas
+      apptainer exec -B "$PWD":/data mmseqs2.sif \
+          af3-msa-json --fasta /data/query.fasta --msa-dir /data/msas \
+              --name my_complex --out /data/input.json
+
+      # 3. fold, with the OTHER image
+      apptainer run --nv -B /models:/models:ro -B "$PWD":/data alphafold3.sif \
+          --json_path=/data/input.json --model_dir=/models --output_dir=/data/out \
+          --norun_data_pipeline --resolve_msa_overlaps=false
+
+    `--resolve_msa_overlaps=false` is not optional when you bring your own MSA. Without it
+    AlphaFold deduplicates your unpaired MSA against the paired one, and since pairedMsa
+    is "" but still gets the query added, that can reorder or drop rows.
+
+    One FASTA record per chain. af3-msa-search names each alignment after the record's
+    first token, and af3-msa-json looks the files up by the same name — so keep the FASTA
+    the same between the two commands. For a homomer, give the sequence once and pass
+    --copies: `--copies 2` folds it as two chains sharing one alignment.
+
+    Ligands, ions, nucleic acids and modifications are not written by af3-msa-json. Add
+    those entries to the JSON by hand afterwards; the protein chains are the part that
+    needs the alignment.
+
+    WHAT THE SEARCH DEFAULTS MEAN
+
+      --num-iterations 3   An iterative profile search: hits from round N seed round N+1.
+                           This is what makes MMseqs2 competitive with hhblits on remote
+                           homologues. Set 1 for a fast, shallow search.
+      --sensitivity 8.0    mmseqs -s. 8.0 is near the top of the useful range; 5.7 is the
+                           mmseqs default and perhaps 5x faster.
+      --max-seqs 10000     Hits kept per round. AlphaFold uses a few thousand rows at most.
+      --evalue 0.1         Permissive on purpose: an MSA tolerates a few false positives
+                           better than it tolerates being shallow.
+
+    Anything after the three positional arguments is passed straight to `mmseqs search`,
+    so site-specific flags need no change here:
+
+      af3-msa-search q.fasta /db/uniref90 msas -- --db-load-mode 2 --split-memory-limit 100G
+
+    ABOUT THE GPU BUILD (MMSEQS_BUILD=gpu, untested here)
+
+    It is not a drop-in. The target database has to be rebuilt in padded form:
+
+      mmseqs makepaddedseqdb /db/uniref90 /db/uniref90_gpu
+
+    then search it with `--gpu 1`, which also wants `--db-load-mode 2`. It needs an sm_80
+    or newer card, and the whole padded database resident in GPU memory or streamed. For
+    one-off jobs the CPU build is simpler and quick enough; for a sweep of hundreds of
+    targets the GPU build is where the time goes back.
+
+    FIDELITY, STATED PLAINLY: these are not the alignments AlphaFold 3 was evaluated with.
+    The official pipeline is jackhmmer over ~630 GB of genetic databases. Build the
+    AlphaFold 3 image with --build-arg AF3_HMMER=yes and stage those databases if a result
+    has to be defensible.
+
+    Licence: MMseqs2 is MIT. The helper scripts here are part of this repository.

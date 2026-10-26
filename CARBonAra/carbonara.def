@@ -1,20 +1,225 @@
-Bootstrap: docker
-From: nvidia/cuda:11.8.0-runtime-ubuntu22.04
+# CARBonAra — Apptainer definition.
+#
+# Context-aware protein sequence design: given a backbone, it predicts which amino acids
+# fit each position, conditioned on everything else in the structure — other chains,
+# nucleic acids, ligands, ions, even waters if you leave them in. Unlike most inverse
+# folding models it reads no sequence information at all, only geometry and element
+# identity, which is what lets it design around a non-protein partner.
+#
+#   apptainer build --fakeroot --build-arg CARBONARA_ACCELERATOR=cu12 carbonara-cu12.sif carbonara.def
+#   apptainer build --fakeroot --build-arg CARBONARA_ACCELERATOR=cu13 carbonara-cu13.sif carbonara.def
+#   apptainer build --fakeroot --build-arg CARBONARA_ACCELERATOR=cpu  carbonara-cpu.sif  carbonara.def
+#
+# Pick by the TARGET machine's driver, not by its GPU: the driver caps the CUDA major
+# version, minor versions are forward compatible and major versions are not. A cu13 image
+# on a 560-series driver aborts at CUDA init with "The NVIDIA driver on your system is too
+# old". See the top-level README for the three gates in full.
+#
+# The model is 6 MB and a single design is seconds, so `cpu` is a real option — worth it
+# for a handful of structures, or anywhere you would rather not negotiate a GPU driver.
+# Sampling many sequences per scaffold is where a GPU starts to pay.
+#
+# Two things about packaging this one:
+#
+#   1. THE WEIGHTS ARE INSIDE THE PACKAGE. setup.py ships model/save/<variant>/model.pt as
+#      package_data, and the CARBonAra class resolves it relative to its own __file__. So
+#      there is nothing to download, nothing to bind-mount, and no HF cache to warm. The
+#      previous version of this definition ran a model-loading line labelled "pre-download
+#      model weights"; it downloaded nothing and was only ever a smoke test. That job now
+#      belongs to %test, which does it properly on a real structure.
+#   2. NUMPY IS NOT PINNED, DELIBERATELY. Sibling models from this group need `numpy<2`
+#      because they predate the numpy 2 removals. CARBonAra does not: the whole of
+#      carbonara.py and src/ was checked for the removed aliases (np.float, np.bool,
+#      np.int, in1d, row_stack, alltrue) and uses none of them. If a future rebuild fails
+#      inside preprocessing with an AttributeError on a numpy attribute, that check is what
+#      to repeat before adding a pin.
+
+BootStrap: docker
+From: python:3.11.14-slim-bookworm
+
+%arguments
+    CARBONARA_ACCELERATOR=cu12
+
+%labels
+    Maintainer  Benedikt Singer
+    Tool        CARBonAra
+    Upstream    https://github.com/LBM-EPFL/CARBonAra
+    Commit      f3b942f94bf5b9cbf2b973c9c0581c73f180576b
+    Accelerator {{ CARBONARA_ACCELERATOR }}
+    License     CC BY-NC-SA 4.0
+
+%environment
+    export CARBONARA_HOME=/opt/CARBonAra
+    export PYTHONNOUSERSITE=1
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    # The SIF is read-only and $HOME may be unwritable or shared between concurrent jobs.
+    # Point everything that insists on writing at node-local /tmp.
+    export XDG_CACHE_HOME=/tmp/carbonara-cache
+    export MPLCONFIGDIR=/tmp/carbonara-cache/mpl
+    export CUDA_CACHE_PATH=/tmp/carbonara-cache/nv
+    export TORCH_HOME=/tmp/carbonara-cache/torch
 
 %post
-    apt-get update && apt-get install -y \
-        python3.10 \
-        python3-pip \
-        git \
-        wget \
-        && rm -rf /var/lib/apt/lists/*
-    
-    git clone https://github.com/LBM-EPFL/CARBonAra.git /app/CARBonAra
-    cd /app/CARBonAra
-    pip install --no-cache-dir .
-    
-    # Pre-download model weights
-    python3 -c "from carbonara import CARBonAra; model = CARBonAra(device_name='cpu')"
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    CARBONARA_ACCELERATOR={{ CARBONARA_ACCELERATOR }}
+    CARBONARA_COMMIT=f3b942f94bf5b9cbf2b973c9c0581c73f180576b
+
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates git
+    rm -rf /var/lib/apt/lists/*
+
+    python -m pip install --no-cache-dir "uv>=0.13.4"
+
+    git clone https://github.com/LBM-EPFL/CARBonAra.git /opt/CARBonAra
+    git -C /opt/CARBonAra checkout --quiet "${CARBONARA_COMMIT}"
+    rm -rf /opt/CARBonAra/.git
+
+    # Torch backend follows the accelerator. `--torch-backend` makes uv resolve the wheel
+    # index itself, which is what keeps the CUDA libraries inside the wheels and lets this
+    # build start from a plain python base image rather than an nvidia/cuda one.
+    case "${CARBONARA_ACCELERATOR}" in
+        cu13) TORCH_ARGS="--torch-backend=cu130" ;;
+        cu12) TORCH_ARGS="--torch-backend=cu126" ;;
+        cpu)  TORCH_ARGS="--torch-backend=cpu" ;;
+        *) echo "CARBONARA_ACCELERATOR must be cu12, cu13 or cpu (got '${CARBONARA_ACCELERATOR}')" >&2; exit 2 ;;
+    esac
+
+    # Install from the clone. setup.py reads requirements.txt, so the dependency list stays
+    # upstream's; only torch's wheel index is ours.
+    uv pip install --system --no-cache ${TORCH_ARGS} /opt/CARBonAra
+
+    # The examples are kept: %test uses 2oob.pdb, and it is the fastest way for a user to
+    # check the image does something before pointing it at their own structure.
+    test -f /opt/CARBonAra/examples/2oob.pdb
+
+    # Assert the weights really travelled with the package. package_data is quiet when it
+    # misses a pattern, so a broken install looks identical to a good one until the first
+    # run fails with FileNotFoundError on model.pt.
+    export CARBONARA_ACCELERATOR_CHECK="${CARBONARA_ACCELERATOR}"
+    python - <<'PYEOF'
+import os
+import pathlib
+
+import carbonara
+import torch
+
+root = pathlib.Path(carbonara.__file__).parent
+variant = root / "model" / "save" / "s_v6_4_2022-09-16_11-51"
+weights = variant / "model.pt"
+cdf = variant / "s_v6_4_2022-09-16_11-51_cdf.csv"
+
+for path in (weights, cdf, variant / "config.py", variant / "model.py"):
+    assert path.is_file(), "missing from the installed package: {}".format(path)
+# A stopped download or a half-copied file still has the right name; the real checkpoint is
+# 6.4 MB, so anything under a megabyte is a truncation, not a smaller model.
+assert weights.stat().st_size > 1_000_000, "model.pt is {} bytes".format(weights.stat().st_size)
+
+accel = os.environ["CARBONARA_ACCELERATOR_CHECK"]
+archs = torch.cuda.get_arch_list()
+print("torch", torch.__version__, "accelerator", accel)
+print("arch list:", archs)
+if accel == "cpu":
+    assert not archs, "cpu build should carry no CUDA archs, got {}".format(archs)
+else:
+    # sm_90 is Hopper and is present in both cu126 and cu130 wheels; its absence means the
+    # torch backend selection did not take effect.
+    assert any(a.startswith("sm_90") for a in archs), archs
+    if accel == "cu13":
+        assert any(a.startswith("sm_100") for a in archs), \
+            "cu13 build has no Blackwell kernels: {}".format(archs)
+print("packaged weights OK:", weights.stat().st_size, "bytes")
+PYEOF
+
+    # Shrink the image: pip's own build tooling is not needed at run time.
+    python -m pip uninstall -y uv || true
+    find / -xdev -name '__pycache__' -type d -prune -exec rm -rf {} + || true
+
+%test
+    set -eu
+    # A real design on a real structure, on the CPU, so this test runs identically on a
+    # build node with no GPU. It exercises the whole path: PDB parsing, feature encoding,
+    # topology extraction, a forward pass, confidence mapping and FASTA output.
+    #
+    # What this test CANNOT tell you: whether the image runs on your cluster. It never
+    # touches the driver and never initialises a GPU. Both of those fail at run time, in a
+    # real job, and they fail with their own distinct errors — see the README.
+    OUT="$(mktemp -d)"
+    carbonara --device cpu --num_sequences 2 --sampling_method sampled \
+        /opt/CARBonAra/examples/2oob.pdb "$OUT"
+    test -s "$OUT/2oob_0.fasta"
+    test -s "$OUT/2oob_pssm.csv"
+    test -s "$OUT/2oob_scaffold.pdb"
+    head -c 200 "$OUT/2oob_0.fasta"; echo
+    rm -rf "$OUT"
+    echo "CARBONARA_TEST_OK"
 
 %runscript
     exec carbonara "$@"
+
+%help
+    CARBonAra — context-aware protein sequence design (inverse folding).
+
+      apptainer exec --nv -B "$PWD":/data carbonara-cu12.sif \
+        carbonara --device cuda --num_sequences 10 --imprint_ratio 0.5 \
+          /data/scaffold.pdb /data/out
+
+    Positional arguments are the input PDB and an output DIRECTORY (not a file). For each
+    run you get <name>_scaffold.pdb (the structure as the model saw it), <name>_pssm.csv
+    (per-position amino-acid probabilities) and <name>_<k>.fasta, one per sampled sequence
+    with its score in the header. Chains are joined by ':' inside a single FASTA record.
+
+    Options worth knowing:
+
+      --num_sequences N       sequences to sample (default 1)
+      --imprint_ratio R       how much of the sampled sequence is fed back in during
+                              iterative sampling, 0-1 (default 0.5). Lower is more diverse,
+                              higher is more self-consistent.
+      --sampling_method       'sampled' (default) or 'max'. This chooses only how the
+                              FIRST, imprint-free prediction is turned into a sequence:
+                              'sampled' draws from the per-position confidence, 'max' takes
+                              the argmax. NEITHER IS REPRODUCIBLE -- see below.
+      --known_chains A,B      keep these chains' sequences fixed and design the rest
+      --known_positions ...   comma-separated residue INDICES (0-based, over the whole
+                              structure) to hold fixed
+      --unknown_positions ... the inverse: design only these indices
+      --ignored_amino_acids C,M   exclude residue types from sampling (cysteine-free
+                              designs, methionine-free for expression, and so on)
+      --ignore_hetatm         drop HETATM records. Default is to KEEP them, which is the
+                              point of this model: ligands, ions and nucleic acids are
+                              context it designs against.
+      --ignore_water          drop waters (default keeps them)
+      --device cuda|cpu       default cuda. With no usable GPU torch falls back to CPU
+                              silently, so a job that is mysteriously slow is worth
+                              checking here first.
+
+    REPRODUCIBILITY: THERE IS NO SEED, AND `max` IS NOT DETERMINISTIC.
+
+    Each sampling iteration masks the imprint at random --
+    `mm = np.random.rand(n) <= (1 - imprint_ratio)` in imprint_sampling -- and nothing
+    seeds numpy. So --sampling_method max gives you N DIFFERENT sequences for
+    --num_sequences N, and re-running the same command gives different answers again.
+    Measured on examples/2oob.pdb at the default imprint_ratio=0.5: two independent
+    comparisons agreed at 107/117 (91.5%) and 109/117 (93.2%).
+
+    Two settings are deterministic, because they make that random mask irrelevant:
+
+      --imprint_ratio 1.0   nothing is masked, so the imprint is exactly the sampled
+                            sequence (most self-consistent)
+      --imprint_ratio 0.0   everything is masked, so every iteration reduces to the
+                            imprint-free prediction (and all N sequences come out equal)
+
+    Anywhere in between, treat the output as a sample and not as a result you can quote by
+    its sequence. If you need a reproducible pipeline, record the FASTAs you got.
+
+    This image installs the s_v6_4 variant, which is the one upstream ships and the one the
+    paper reports. The repository also contains s_v6_5, but setup.py does not package it,
+    so it is not in site-packages here.
+
+    Nothing is downloaded at run time: weights ride inside the installed package, so the
+    image works with no network.
+
+    Licence: CC BY-NC-SA 4.0 — non-commercial, and derivative works inherit the terms.

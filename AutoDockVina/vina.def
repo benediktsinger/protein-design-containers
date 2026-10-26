@@ -1,0 +1,248 @@
+# AutoDock Vina — Apptainer definition.
+#
+# Molecular docking: scores and optimises the pose of a small-molecule ligand against a
+# rigid (or partly flexible) receptor. Packaged here with Meeko, which is what turns an
+# ordinary structure file into the PDBQT format Vina actually reads.
+#
+#   apptainer build --fakeroot vina.sif vina.def
+#   apptainer build --fakeroot --build-arg VINA_PYTHON=no vina-cli.sif vina.def
+#
+# THIS CONTAINER DOES NOT USE A GPU. Vina is a CPU docking engine and scales with CPU
+# cores, not cards. Run it without `--nv`, and ask the scheduler for cores rather than a
+# GPU; `--exhaustiveness` and `--cpu` are the knobs that matter. (AutoDock-GPU is a
+# different program and is not packaged here.)
+#
+# Unlike every other image in this repository, this one is ARCHITECTURE-PORTABLE. Upstream
+# publishes static linux binaries for both x86_64 and aarch64, and the %post below picks by
+# `uname -m`, so the same definition builds a working image on an ARM machine such as a
+# GH200 node. Build it on the architecture you will run it on; nothing here cross-builds.
+#
+# About the Python bindings (VINA_PYTHON, default yes): scripting a docking sweep through
+# the Python API is a common reason to want Vina in a container at all. On x86_64 this is
+# just an install — vina 1.2.7 publishes manylinux and musllinux wheels for cp38 to cp312,
+# with Boost vendored inside them, so there is no toolchain and no runtime library to
+# manage. On ARM there is no wheel, so the extension is compiled from source and Boost and
+# SWIG are installed and kept. If a future rebuild breaks on that, `--build-arg
+# VINA_PYTHON=no` gives a smaller image with the command-line tools intact.
+
+BootStrap: docker
+From: python:3.12.12-slim-bookworm
+
+%arguments
+    VINA_PYTHON=yes
+
+%labels
+    Maintainer  Benedikt Singer
+    Tool        AutoDock Vina
+    Upstream    https://github.com/ccsb-scripps/AutoDock-Vina
+    Version     1.2.7
+    Meeko       0.8.0
+    License     Apache-2.0
+
+%environment
+    export PYTHONNOUSERSITE=1
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+    export XDG_CACHE_HOME=/tmp/vina-cache
+    export MPLCONFIGDIR=/tmp/vina-cache/mpl
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    VINA_VERSION=1.2.7
+    MEEKO_VERSION=0.8.0
+    VINA_PYTHON={{ VINA_PYTHON }}
+
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates wget
+    rm -rf /var/lib/apt/lists/*
+
+    # Upstream's release assets are named by platform. Select by the build machine's
+    # architecture rather than assuming x86_64, so this definition also builds on ARM.
+    case "$(uname -m)" in
+        x86_64)          VINA_ARCH=linux_x86_64 ;;
+        aarch64|arm64)   VINA_ARCH=linux_aarch64 ;;
+        *) echo "no upstream Vina binary for $(uname -m)" >&2; exit 2 ;;
+    esac
+
+    BASE="https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v${VINA_VERSION}"
+    wget -q -O /usr/local/bin/vina       "${BASE}/vina_${VINA_VERSION}_${VINA_ARCH}"
+    wget -q -O /usr/local/bin/vina_split "${BASE}/vina_split_${VINA_VERSION}_${VINA_ARCH}"
+    chmod 755 /usr/local/bin/vina /usr/local/bin/vina_split
+
+    # These are prebuilt binaries off a release page, so prove they actually execute on this
+    # architecture now, at build time. A wrong-architecture or truncated download otherwise
+    # only surfaces as "Exec format error" inside somebody's job.
+    /usr/local/bin/vina --version
+    /usr/local/bin/vina_split --help > /dev/null 2>&1 || true
+
+    python -m pip install --no-cache-dir "uv>=0.13.4"
+
+    # Meeko prepares both ligands and receptors as PDBQT and writes docked poses back out to
+    # SDF. RDKit is its chemistry backend and is what reads SMILES, SDF and MOL2.
+    #
+    # EVERY ONE OF THESE IS LISTED BY HAND BECAUSE MEEKO DECLARES NO DEPENDENCIES AT ALL:
+    # its wheel metadata has an empty requires_dist, so `pip install meeko` pulls in
+    # nothing and then `import meeko` dies with ModuleNotFoundError for whichever one is
+    # missing (gemmi, reached through meeko.polymer -> meeko.chemtempgen, is the first).
+    # If a future meeko adds an import, this list is where it goes, and %test is what
+    # catches the omission.
+    #
+    # prody is needed by mk_prepare_receptor.py specifically -- the ligand path works
+    # without it, so a build that omits it looks fine right up to the first receptor.
+    #
+    # Deliberately NOT installed: torch, openff/espaloma, AutoDockTools. Meeko
+    # imports those only on optional paths (force-field parameterisation, reactive
+    # docking) and each is large enough to change the size of this image materially.
+    uv pip install --system --no-cache \
+        "meeko==${MEEKO_VERSION}" \
+        "rdkit" \
+        "numpy" \
+        "scipy" \
+        "gemmi" \
+        "pandas" \
+        "prody"
+
+    case "${VINA_PYTHON}" in
+        yes)
+            case "$(uname -m)" in
+                x86_64)
+                    # A wheel exists for this interpreter (cp38-cp312, manylinux_2_17 and
+                    # musllinux_1_2), with Boost vendored in by auditwheel. Nothing is
+                    # compiled and nothing has to stay behind in the image.
+                    uv pip install --system --no-cache "vina==${VINA_VERSION}"
+                    ;;
+                aarch64|arm64)
+                    # No ARM wheel is published, so the extension is compiled here and
+                    # Boost and SWIG are installed for it. They are deliberately NOT
+                    # purged afterwards: the extension links against the Boost runtime
+                    # libraries, and `apt-get autoremove` takes those with the -dev
+                    # packages, leaving an import that fails with
+                    # "libboost_filesystem.so.1.74.0: cannot open shared object file".
+                    apt-get update
+                    apt-get install -y --no-install-recommends \
+                        build-essential swig libboost-all-dev
+                    rm -rf /var/lib/apt/lists/*
+                    # LD_PRELOAD is dropped for the compile on purpose. Apptainer injects
+                    # its libfakeroot interposer into every process in %post, and during a
+                    # C++ build of this size it intermittently corrupts object files: the
+                    # link then dies with "file format not recognized" on a .o, after a
+                    # wall of "libfakeroot internal error: payload not recognized!".
+                    # Compiling needs no faked root, so taking the interposer out of the
+                    # way for this one command is both safe and sufficient.
+                    env -u LD_PRELOAD uv pip install --system --no-cache \
+                        "vina==${VINA_VERSION}"
+                    ;;
+                *)
+                    echo "no Vina python bindings for $(uname -m)" >&2; exit 2 ;;
+            esac
+            python -c "import vina; print('vina python bindings OK', vina.__version__)"
+            ;;
+        no)
+            echo "skipping python bindings (VINA_PYTHON=no); command-line tools only"
+            ;;
+        *)
+            echo "VINA_PYTHON must be yes or no (got '${VINA_PYTHON}')" >&2
+            exit 2
+            ;;
+    esac
+
+%test
+    set -eu
+    vina --version
+    python -c "import meeko, rdkit; print('meeko', meeko.__version__, 'rdkit', rdkit.__version__)"
+    command -v mk_prepare_ligand.py > /dev/null && echo "meeko CLI present"
+
+    # A real docking run on a ligand and receptor built here, so the test covers the whole
+    # chain: RDKit reads SMILES, Meeko writes PDBQT, Vina scores poses. A passing
+    # `vina --version` says nothing about whether docking works.
+    T="$(mktemp -d)"
+    python - "$T" <<'RDKEOF'
+import sys
+
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+root = sys.argv[1]
+
+# Aspirin: small, with a couple of rotatable bonds, so the search has something to do.
+mol = Chem.AddHs(Chem.MolFromSmiles("CC(=O)Oc1ccccc1C(=O)O"))
+AllChem.EmbedMolecule(mol, randomSeed=0xF00D)
+AllChem.MMFFOptimizeMolecule(mol)
+Chem.MolToMolFile(mol, root + "/ligand.sdf")
+
+# A one-residue receptor, written by hand. This is a plumbing test, not a meaningful
+# docking: what is being checked is that each tool reads what the previous one wrote.
+pdb = """ATOM      1  N   ALA A   1      10.000  10.000  10.000  1.00  0.00           N
+ATOM      2  CA  ALA A   1      11.458  10.000  10.000  1.00  0.00           C
+ATOM      3  C   ALA A   1      12.009  11.420  10.000  1.00  0.00           C
+ATOM      4  O   ALA A   1      11.273  12.390  10.000  1.00  0.00           O
+ATOM      5  CB  ALA A   1      11.979   9.235  11.213  1.00  0.00           C
+TER
+END
+"""
+with open(root + "/receptor.pdb", "w") as handle:
+    handle.write(pdb)
+print("built ligand.sdf and receptor.pdb")
+RDKEOF
+
+    mk_prepare_ligand.py -i "$T/ligand.sdf" -o "$T/ligand.pdbqt"
+    test -s "$T/ligand.pdbqt"
+
+    # The receptor box IS the search space. Getting it wrong is the commonest way a
+    # docking run returns a confident number about the wrong part of the protein.
+    mk_prepare_receptor.py -i "$T/receptor.pdb" -o "$T/receptor" -p \
+        --box_center 11.5 10.5 10.5 --box_size 16 16 16 > /dev/null
+
+    vina --receptor "$T/receptor.pdbqt" --ligand "$T/ligand.pdbqt" \
+        --center_x 11.5 --center_y 10.5 --center_z 10.5 \
+        --size_x 16 --size_y 16 --size_z 16 \
+        --exhaustiveness 2 --seed 42 --cpu 2 \
+        --out "$T/docked.pdbqt" | tail -12
+    grep -q "REMARK VINA RESULT" "$T/docked.pdbqt"
+    rm -rf "$T"
+    echo "VINA_TEST_OK"
+
+%runscript
+    exec vina "$@"
+
+%help
+    AutoDock Vina 1.2.7 with Meeko. CPU only — do not pass --nv.
+
+    Vina reads PDBQT, which is not a format anything else writes, so preparation is a real
+    step rather than a formality:
+
+      # ligand: SDF/MOL2/SMILES -> PDBQT
+      apptainer exec --bind "$PWD":/data vina.sif \
+          mk_prepare_ligand.py -i /data/ligand.sdf -o /data/ligand.pdbqt
+
+      # receptor: PDB/mmCIF -> PDBQT (strip waters and other unwanted heteroatoms first)
+      apptainer exec --bind "$PWD":/data vina.sif \
+          mk_prepare_receptor.py -i /data/receptor.pdb -o /data/receptor \
+          --box_center 11.0 22.0 33.0 --box_size 20 20 20
+
+      # dock
+      apptainer run --bind "$PWD":/data vina.sif \
+          --receptor /data/receptor.pdbqt \
+          --ligand /data/ligand.pdbqt \
+          --config /data/receptor.box.txt \
+          --exhaustiveness 32 \
+          --cpu 8 \
+          --out /data/docked.pdbqt
+
+      # split a multi-model result into one file per pose
+      apptainer exec --bind "$PWD":/data vina.sif vina_split --input /data/docked.pdbqt
+
+    THE SEARCH BOX IS THE RESULT. Vina only searches inside the box you give it, so a box
+    that misses the pocket returns confident nonsense rather than an error. Derive the
+    centre from a known ligand or a pocket prediction, and check it before a large sweep.
+
+    ON A CLUSTER: ask for cores, not a GPU. `--cpu N` should match the cores the scheduler
+    actually gave you; left unset Vina reads the machine's core count, which on a shared
+    node is far more than your allocation and oversubscribes it.
+
+    Reproducibility: pass `--seed` for a repeatable run. Without it, Vina seeds from the
+    clock and successive runs differ.
+
+    Apache-2.0 (Vina). Meeko is LGPL-2.1 and RDKit is BSD-3-Clause.

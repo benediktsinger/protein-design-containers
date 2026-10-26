@@ -1,0 +1,344 @@
+# PeSTo (Protein Structure Transformer) — Apptainer definition.
+#
+# Predicts protein binding interfaces from a structure, with no MSA and no parameters
+# describing the atoms beyond their element. Fast enough to run over MD ensembles.
+#
+#   apptainer build --fakeroot --build-arg PESTO_ACCELERATOR=cu12 pesto-cu12.sif pesto.def
+#   apptainer build --fakeroot --build-arg PESTO_ACCELERATOR=cu13 pesto-cu13.sif pesto.def
+#   apptainer build --fakeroot --build-arg PESTO_ACCELERATOR=cpu  pesto-cpu.sif  pesto.def
+#
+# Pick by the TARGET machine's driver, not by its GPU: the driver caps the CUDA major
+# version, minor versions are forward compatible and major versions are not. A cu13 image
+# on a 560-series driver aborts at CUDA init with "The NVIDIA driver on your system is too
+# old". See the top-level README for the three gates in full.
+#
+# PeSTo is genuinely cheap — a single structure is seconds on a CPU — so the `cpu` build is
+# not a fallback, it is the sensible choice for anything that is not a large batch or an MD
+# trajectory. It is also the only build that runs anywhere without checking a driver.
+#
+# Two things about packaging this particular repository:
+#
+#   1. UPSTREAM SHIPS NO CLI. Inference lives in apply_model.ipynb, a notebook. Running a
+#      notebook inside a batch job is miserable, so this image installs `pesto-predict`,
+#      written to follow that notebook step for step (same model, same preprocessing, same
+#      topology cut-off of 64 neighbours, same b-factor encoding, same `_i<N>.pdb` output
+#      naming). It is a transcription, not a reimplementation: if upstream changes the
+#      notebook, this script is what has to be revisited.
+#   2. THE MODEL DIRECTORY IS A PYTHON PACKAGE. Each `model/save/<variant>` carries its own
+#      config.py, data_handler.py and model.py, and the notebook puts that directory on
+#      sys.path before importing them. So the variant chosen at run time changes which
+#      module is imported, not just which checkpoint is loaded. The driver below does the
+#      same thing rather than importing a top-level `model`.
+#
+# Weights ship inside the repository (a few MB each), so there is nothing to download and
+# the image works with no network.
+
+BootStrap: docker
+From: python:3.11.14-slim-bookworm
+
+%arguments
+    PESTO_ACCELERATOR=cpu
+
+%labels
+    Maintainer  Benedikt Singer
+    Tool        PeSTo
+    Upstream    https://github.com/LBM-EPFL/PeSTo
+    Commit      ba651aa29aaa839d0ee2c458dee90ca1f934d90a
+    Accelerator {{ PESTO_ACCELERATOR }}
+    License     CC BY-NC-SA 4.0
+
+%environment
+    export PESTO_HOME=/opt/PeSTo
+    export PYTHONNOUSERSITE=1
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    # The SIF is read-only and $HOME may be unwritable or shared between concurrent jobs.
+    # Point everything that insists on writing at node-local /tmp.
+    export XDG_CACHE_HOME=/tmp/pesto-cache
+    export MPLCONFIGDIR=/tmp/pesto-cache/mpl
+    export CUDA_CACHE_PATH=/tmp/pesto-cache/nv
+    export TORCH_HOME=/tmp/pesto-cache/torch
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    PESTO_ACCELERATOR={{ PESTO_ACCELERATOR }}
+    PESTO_COMMIT=ba651aa29aaa839d0ee2c458dee90ca1f934d90a
+
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates git
+    rm -rf /var/lib/apt/lists/*
+
+    python -m pip install --no-cache-dir "uv>=0.13.4"
+
+    git clone https://github.com/LBM-EPFL/PeSTo.git /opt/PeSTo
+    git -C /opt/PeSTo checkout --quiet "${PESTO_COMMIT}"
+    rm -rf /opt/PeSTo/.git
+
+    # Torch backend follows the accelerator. `--torch-backend` makes uv resolve the wheel
+    # index itself, which is what keeps the CUDA libraries inside the wheels and lets this
+    # build start from a plain python base image rather than an nvidia/cuda one.
+    case "${PESTO_ACCELERATOR}" in
+        cu13) TORCH_ARGS="--torch-backend=cu130" ;;
+        cu12) TORCH_ARGS="--torch-backend=cu126" ;;
+        cpu)  TORCH_ARGS="--torch-backend=cpu" ;;
+        *) echo "PESTO_ACCELERATOR must be cu12, cu13 or cpu (got '${PESTO_ACCELERATOR}')" >&2; exit 2 ;;
+    esac
+
+    # numpy is held below 2.0 deliberately. This code is from 2021-2023 and predates the
+    # numpy 2 removals; upstream pins nothing, so an unconstrained build silently resolves
+    # numpy 2.x and the failure surfaces as an AttributeError deep inside preprocessing
+    # rather than at install time.
+    uv pip install --system --no-cache ${TORCH_ARGS} \
+        "torch" \
+        "numpy<2" \
+        "scipy" \
+        "pandas" \
+        "gemmi" \
+        "tqdm"
+
+    # --- pesto-predict: a batch CLI following apply_model.ipynb ---
+    # Written flush-left on purpose. An indented heredoc body is still indented Python and
+    # raises IndentationError at import, which would only be found by running the image.
+    cat > /opt/PeSTo/pesto_predict.py <<'PYEOF'
+"""Batch interface prediction with PeSTo.
+
+Follows apply_model.ipynb step for step. Writes one PDB per predicted interface type,
+with the per-residue probability (0-1) in the b-factor column, named <input>_i<N>.pdb
+exactly as upstream does.
+"""
+
+import argparse
+import os
+import re
+import sys
+from glob import glob
+
+import torch as pt
+
+PESTO_HOME = os.environ.get("PESTO_HOME", "/opt/PeSTo")
+
+# Upstream imports `src.*` relative to the repository root, so the root has to be on the
+# path and has to be the working directory for its relative data lookups.
+if PESTO_HOME not in sys.path:
+    sys.path.insert(0, PESTO_HOME)
+
+# This tool's own output: <input stem>_i<channel>.pdb.
+OUTPUT_PATTERN = re.compile(r"_i\d+\.pdb$")
+
+VARIANTS = {
+    "i_v4_1": "model/save/i_v4_1_2021-09-07_11-21",
+    "i_v4_0": "model/save/i_v4_0_2021-09-07_11-20",
+    "i_v3_1": "model/save/i_v3_1_2021-05-28_12-40",
+    "i_v3_0": "model/save/i_v3_0_2021-05-27_14-27",
+}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="PeSTo interface prediction")
+    ap.add_argument("inputs", nargs="+",
+                    help="PDB files, or directories searched for *.pdb")
+    ap.add_argument("--output_dir", default=None,
+                    help="where to write results (default: beside each input)")
+    ap.add_argument("--variant", default="i_v4_1", choices=sorted(VARIANTS),
+                    help="trained model variant (default: i_v4_1, the one used in the paper)")
+    ap.add_argument("--checkpoint", default="model_ckpt.pt",
+                    choices=["model_ckpt.pt", "model.pt"],
+                    help="which checkpoint file inside the variant directory")
+    ap.add_argument("--device", default="cpu",
+                    help="cpu, cuda, cuda:0, ... (default: cpu; PeSTo is fast on CPU)")
+    ap.add_argument("--nn_topk", type=int, default=64,
+                    help="neighbours kept when extracting topology (upstream default: 64)")
+    args = ap.parse_args()
+
+    # Upstream's relative paths only resolve from the repository root.
+    os.chdir(PESTO_HOME)
+
+    save_path = os.path.join(PESTO_HOME, VARIANTS[args.variant])
+    model_filepath = os.path.join(save_path, args.checkpoint)
+    if not os.path.isfile(model_filepath):
+        sys.exit("checkpoint not found: {}".format(model_filepath))
+
+    # IMPORT ORDER IS LOAD-BEARING, and it is the notebook's order.
+    #
+    # `src.*` is imported FIRST, while sys.path still has only the repository root on it,
+    # so `src` binds to the repository's own package. Each variant directory carries a
+    # bundled 2021 copy of `src` as well, and putting that directory on the path first
+    # would shadow the repository's: the bundled copy still calls np.object, removed in
+    # numpy 1.24, and the run then dies at the first structure with
+    #   AttributeError: module 'numpy' has no attribute 'object'
+    # raised from inside tag_hetatm_chains -- nowhere near anything that mentions a model
+    # variant, so the cause is not obvious from the traceback.
+    from src.dataset import StructuresDataset, collate_batch_features
+    from src.data_encoding import encode_structure, encode_features, extract_topology
+    from src.structure import encode_bfactor, concatenate_chains, split_by_chain
+    from src.structure_io import save_pdb
+
+    # ONLY the saved architecture comes from the variant directory: config.py and model.py
+    # live beside the checkpoint, and importing a top-level `model` instead would load the
+    # training code rather than the architecture these weights were saved from.
+    if save_path not in sys.path:
+        sys.path.insert(0, save_path)
+    from config import config_model
+    from model import Model
+
+    # Collect inputs.
+    #
+    # Files this tool wrote itself are skipped when SEARCHING A DIRECTORY, so re-running
+    # over an output directory does not predict on predictions. Upstream's notebook
+    # filters on the substring "_i", which also silently discards innocent names --
+    # my_input.pdb, protein_ion.pdb, anything with "_i" in it. Matching the actual output
+    # pattern, _i<N>.pdb, does the intended job without the collateral damage.
+    #
+    # A file named explicitly on the command line is never filtered: if you asked for it,
+    # you meant it, even if it is one of our own outputs.
+    pdb_filepaths = []
+    for item in args.inputs:
+        if os.path.isdir(item):
+            found = sorted(glob(os.path.join(item, "**", "*.pdb"), recursive=True))
+            pdb_filepaths.extend(
+                fp for fp in found if not OUTPUT_PATTERN.search(os.path.basename(fp)))
+        else:
+            pdb_filepaths.append(item)
+    if not pdb_filepaths:
+        sys.exit("no input PDB files found")
+
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    device = pt.device(args.device)
+    model = Model(config_model)
+    model.load_state_dict(pt.load(model_filepath, map_location=pt.device("cpu")))
+    model = model.eval().to(device)
+
+    dataset = StructuresDataset(pdb_filepaths, with_preprocessing=True)
+    print("loaded {} structure(s), variant {}, device {}".format(
+        len(dataset), args.variant, args.device), flush=True)
+
+    written = 0
+    with pt.no_grad():
+        for subunits, filepath in dataset:
+            structure = concatenate_chains(subunits)
+
+            X, M = encode_structure(structure)
+            q = encode_features(structure)[0]
+            ids_topk, _, _, _, _ = extract_topology(X, args.nn_topk)
+
+            # The collate call also sets up the sink node; the model is wrong without it.
+            X, ids_topk, q, M = collate_batch_features([[X, ids_topk, q, M]])
+
+            z = model(X.to(device), ids_topk.to(device), q.to(device), M.float().to(device))
+
+            stem = os.path.basename(filepath)[:-4]
+            out_dir = args.output_dir if args.output_dir else os.path.dirname(filepath)
+            for i in range(z.shape[1]):
+                p = pt.sigmoid(z[:, i])
+                out_structure = encode_bfactor(structure, p.cpu().numpy())
+                output_filepath = os.path.join(out_dir, "{}_i{}.pdb".format(stem, i))
+                save_pdb(split_by_chain(out_structure), output_filepath)
+                written += 1
+            print("{} -> {} interface file(s)".format(filepath, z.shape[1]), flush=True)
+
+    print("wrote {} file(s)".format(written))
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+    python -m py_compile /opt/PeSTo/pesto_predict.py
+
+    printf '#!/bin/sh\nexec python /opt/PeSTo/pesto_predict.py "$@"\n' > /usr/local/bin/pesto-predict
+    chmod 755 /usr/local/bin/pesto-predict
+
+    chmod -R a+rX /opt/PeSTo
+    du -sh /opt/PeSTo
+
+%test
+    set -eu
+    # Deliberately CPU-only and driver-free, so it passes on a build node with no GPU.
+    # A PASSING TEST SAYS NOTHING ABOUT WHETHER THE GPU BUILD RUNS ON YOUR CLUSTER:
+    # it does not touch the driver and does not run a CUDA kernel. Only a real job does.
+    python -c "import torch, gemmi, numpy; print('torch', torch.__version__, '| numpy', numpy.__version__)"
+    python -c "import torch; print('archs:', torch.cuda.get_arch_list() or '(cpu build)')"
+    test -f /opt/PeSTo/model/save/i_v4_1_2021-09-07_11-21/model_ckpt.pt
+    pesto-predict --help > /dev/null
+
+    # A REAL PREDICTION ON A REAL STRUCTURE, not just an import check. pesto_predict.py is
+    # this repository's transcription of upstream's notebook, so the only evidence it works
+    # is that it runs: an earlier version imported cleanly, passed a test like the two
+    # lines above, and then failed on the first actual PDB inside preprocessing.
+    #
+    # The structure is copied under a plain name first -- upstream's test files have colons
+    # in their names, which is legal and awkward.
+    T="$(mktemp -d)"
+    python - "$T" <<'PYTESTEOF'
+import glob
+import os
+import shutil
+import sys
+
+root = sys.argv[1]
+candidates = sorted(glob.glob("/opt/PeSTo/pdbs_test/*.pdb"))
+assert candidates, "no test structures in /opt/PeSTo/pdbs_test"
+shutil.copy(candidates[0], os.path.join(root, "test_input.pdb"))
+print("using", os.path.basename(candidates[0]))
+PYTESTEOF
+
+    pesto-predict "$T/test_input.pdb" --output_dir "$T/out" --device cpu
+
+    python - "$T/out" <<'PYTESTEOF'
+import glob
+import os
+import sys
+
+out = sorted(glob.glob(os.path.join(sys.argv[1], "test_input_i*.pdb")))
+assert out, "pesto-predict wrote nothing"
+
+for path in out:
+    bfactors = []
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith(("ATOM", "HETATM")):
+                bfactors.append(float(line[60:66]))
+    assert bfactors, "{}: no ATOM records".format(path)
+    # All-zero b-factors mean the model loaded, ran, and predicted nothing -- which passes
+    # every check that only looks at whether files appeared.
+    assert max(bfactors) > 0.01, "{}: every interface probability is ~0".format(path)
+    assert 0.0 <= min(bfactors) and max(bfactors) <= 1.0, \
+        "{}: b-factors outside [0, 1], so they are not probabilities".format(path)
+    print("ok {}: {} atoms, max p = {:.3f}".format(
+        os.path.basename(path), len(bfactors), max(bfactors)))
+
+print("{} interface channel(s) written".format(len(out)))
+PYTESTEOF
+    rm -rf "$T"
+    echo "PeSTo self-test OK"
+
+%runscript
+    exec pesto-predict "$@"
+
+%help
+    PeSTo — parameter-free geometric deep learning for protein binding interfaces.
+
+    Predict interfaces for every PDB in a directory:
+
+      apptainer run --bind "$PWD":/data pesto-cpu.sif /data/structures --output_dir /data/out
+
+    On a GPU (only worth it for large batches or MD ensembles):
+
+      apptainer run --nv --bind "$PWD":/data pesto-cu12.sif /data/structures \
+          --output_dir /data/out --device cuda
+
+    Output: one PDB per predicted interface type, named <input>_i<N>.pdb, with the
+    per-residue interface probability (0-1) written into the b-factor column. The number
+    of files depends on the model variant: the i_v3_1 variant predicts protein-protein
+    interfaces only, while i_v4_1 (the default, and the one used in the paper) also
+    distinguishes nucleic acid, lipid, ligand and ion interfaces. See the upstream README
+    for what each channel is.
+
+    Visualise in PyMOL with:   spectrum b, blue_white_red, all, 0, 1
+
+    CC BY-NC-SA 4.0 — non-commercial use only.

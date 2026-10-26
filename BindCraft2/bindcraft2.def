@@ -1,0 +1,219 @@
+# BindCraft2 — Apptainer definition.
+#
+# De novo binder design: miniproteins, scaffolded binders, VHHs/nanobodies, antibodies,
+# cyclic peptides and multistate design in one workflow. Optimises a binder through
+# AlphaFold2, redesigns the sequence with ProteinMPNN, then re-predicts and filters with
+# models that were held back from the optimisation, so a design is never scored by a model
+# that shaped it.
+#
+#   apptainer build --fakeroot --build-arg BINDCRAFT_ACCELERATOR=cu12 bindcraft2-cu12.sif bindcraft2.def
+#   apptainer build --fakeroot --build-arg BINDCRAFT_ACCELERATOR=cu13 bindcraft2-cu13.sif bindcraft2.def
+#
+# Pick by the TARGET cluster's driver, not by its GPU. The driver caps the CUDA major
+# version; minor versions are forward compatible and major versions are not. The upstream
+# installer makes the same distinction (`install.sh cuda12` / `cuda13`), and it chooses by
+# reading the driver of whatever machine runs it — which on a build node is the WRONG
+# machine. That is why the accelerator is a required build argument here with no default:
+# an unattended build must not silently pick CUDA 13 because the build node has no GPU.
+#
+# BindCraft2 cannot run on CPU. Upstream refuses `install.sh cpu` outright, because a single
+# trajectory folds an AlphaFold ensemble hundreds of times.
+#
+# Four things specific to packaging this one:
+#
+#   1. THE CLONE IS THE INSTALLATION. install.sh performs an editable install, so moving or
+#      deleting /opt/BindCraft2 breaks the `bindcraft` command. It stays where it is put,
+#      and the venv it builds beside itself is added to PATH in %environment.
+#   2. WEIGHTS ARE BAKED IN (~5.3 GB of AlphaFold parameters). BINDCRAFT_WEIGHTS is set
+#      before the install so they land inside the image rather than in root's home, and is
+#      set again at run time so a job finds them. ProteinMPNN's checkpoints already ship
+#      inside the package.
+#   3. THE IMAGE CARRIES NO `nvidia-smi`. Upstream files its compiled-graph cache by GPU
+#      model, read from nvidia-smi, and falls back to ${TMPDIR}/bindcraft_xla_cache when it
+#      cannot be reached — which means a container run recompiles every campaign, about 60 s
+#      per prediction shape. JAX_COMPILATION_CACHE_DIR is therefore set explicitly below.
+#      Point it at shared storage for a sweep (see %help); the default here is node-local.
+#   4. ALLOW ~20 GB OF BUILD SCRATCH. The 5.3 GB parameter archive and its unpacked contents
+#      coexist before the archive is deleted, and the accelerator wheels are several GB more.
+#      Build on node-local scratch, not on a shared filesystem.
+
+BootStrap: docker
+From: python:3.12.12-slim-bookworm
+
+%arguments
+    BINDCRAFT_ACCELERATOR=
+
+%labels
+    Maintainer  Benedikt Singer
+    Tool        BindCraft2
+    Upstream    https://github.com/PacesaLab/BindCraft2
+    Version     v1.0.4
+    Accelerator {{ BINDCRAFT_ACCELERATOR }}
+    License     BindCraft2 Source-Available (Hosting-Restricted)
+
+%environment
+    export BINDCRAFT_HOME=/opt/BindCraft2
+    # The editable install lives in the venv beside the clone, exactly where install.sh
+    # puts it. Prepending it to PATH is what makes `bindcraft` resolve.
+    export PATH=/opt/BindCraft2/.venv/bin:$PATH
+    export PYTHONNOUSERSITE=1
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    # Baked-in AlphaFold parameters. BINDCRAFT_AF2_PARAMS would override this; leave it
+    # unset unless you are deliberately pointing at a different copy.
+    export BINDCRAFT_WEIGHTS=/opt/bindcraft-weights
+
+    # The SIF is read-only and $HOME may be unwritable or shared between concurrent jobs.
+    export XDG_CACHE_HOME=/tmp/bindcraft-cache
+    export MPLCONFIGDIR=/tmp/bindcraft-cache/mpl
+    export CUDA_CACHE_PATH=/tmp/bindcraft-cache/nv
+    # Without this, compiled graphs land in ${TMPDIR}/bindcraft_xla_cache and every campaign
+    # pays its compiles again, because the image has no nvidia-smi to name the card with.
+    export JAX_COMPILATION_CACHE_DIR=/tmp/bindcraft-cache/xla
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    # Set by `--build-arg BINDCRAFT_ACCELERATOR=cu12|cu13`. No default on purpose: see header.
+    BINDCRAFT_ACCELERATOR={{ BINDCRAFT_ACCELERATOR }}
+    BINDCRAFT_VERSION=v1.0.4
+
+    case "${BINDCRAFT_ACCELERATOR}" in
+        cu13) INSTALL_ARG=cuda13 ;;
+        cu12) INSTALL_ARG=cuda12 ;;
+        *) echo "BINDCRAFT_ACCELERATOR must be cu12 or cu13 (got '${BINDCRAFT_ACCELERATOR}')" >&2; exit 2 ;;
+    esac
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates git curl wget
+    rm -rf /var/lib/apt/lists/*
+
+    git clone --depth 1 --branch "${BINDCRAFT_VERSION}" \
+        https://github.com/PacesaLab/BindCraft2.git /opt/BindCraft2
+    # The .git directory is kept deliberately small by --depth 1 but removed anyway: an
+    # editable install needs the working tree, never the history.
+    rm -rf /opt/BindCraft2/.git
+
+    # Weights must land inside the image. install.sh honours BINDCRAFT_WEIGHTS, so export it
+    # BEFORE running the installer rather than fetching them in a second pass.
+    export BINDCRAFT_WEIGHTS=/opt/bindcraft-weights
+    mkdir -p "${BINDCRAFT_WEIGHTS}"
+
+    cd /opt/BindCraft2
+    # No Python environment is active here, so install.sh builds /opt/BindCraft2/.venv.
+    bash install.sh "${INSTALL_ARG}"
+
+    # install.sh runs its own checks, but they are advisory on a machine with no GPU. Assert
+    # the two things that would otherwise fail inside somebody's campaign: that every module
+    # and checkpoint the package expects is present, and that the AlphaFold parameters are
+    # complete rather than a stopped transfer (upstream treats an AlphaFold file under
+    # 100 MB as unfinished, and a truncated download otherwise looks like a successful one).
+    export PATH=/opt/BindCraft2/.venv/bin:$PATH
+    python -m bindcraft.selfcheck "${INSTALL_ARG}" --shipped-only
+    bindcraft --help > /dev/null
+
+    python - <<'PYWEIGHTS'
+import os
+import sys
+
+root = os.environ["BINDCRAFT_WEIGHTS"]
+found = []
+for dirpath, _dirnames, filenames in os.walk(root):
+    for name in filenames:
+        if name.startswith("params_") and name.endswith(".npz"):
+            path = os.path.join(dirpath, name)
+            found.append((name, os.path.getsize(path)))
+
+if not found:
+    sys.exit("no AlphaFold parameter files under {}".format(root))
+
+# A campaign uses five multimer models to design against and holds two monomer models back
+# to validate with, so anything under seven means a partial archive.
+if len(found) < 7:
+    sys.exit("expected at least 7 parameter files, found {}: {}".format(
+        len(found), sorted(n for n, _ in found)))
+
+small = [(n, s) for n, s in found if s < 100 * 1024 * 1024]
+if small:
+    sys.exit("these parameter files look like stopped transfers: {}".format(small))
+
+total = sum(s for _, s in found)
+print("AlphaFold parameters OK: {} files, {:.2f} GiB".format(
+    len(found), total / 1024 ** 3))
+PYWEIGHTS
+
+    chmod -R a+rX /opt/BindCraft2 /opt/bindcraft-weights
+    du -sh /opt/BindCraft2 /opt/bindcraft-weights
+
+%test
+    set -eu
+    # Deliberately driver-free, so it passes on a build node with no GPU.
+    # A PASSING TEST DOES NOT MEAN THE IMAGE RUNS ON YOUR CLUSTER. It does not touch the
+    # driver and does not ask JAX for a device, so neither the driver gate nor the GPU
+    # itself is exercised. Only a real campaign does that.
+    export PATH=/opt/BindCraft2/.venv/bin:$PATH
+    bindcraft --help > /dev/null
+    python -c "import jax; print('jax', jax.__version__)"
+    test -d /opt/bindcraft-weights
+    echo "BindCraft2 self-test OK"
+
+%runscript
+    exec bindcraft "$@"
+
+%help
+    BindCraft2 — de novo binder design. GPU required; there is no CPU mode.
+
+    The entry point is `bindcraft`, so arguments start at the subcommand:
+
+      apptainer run --nv --bind "$PWD":/data bindcraft2-cu13.sif \
+          design /data/design.json
+
+    A minimal design.json, with target.pdb beside it:
+
+      {
+        "targets": [{"name": "my_target", "target_path": "/data/target.pdb",
+                     "chains": "A", "hotspots": "54,56,66-70"}],
+        "modality": "binder",
+        "binder_lengths": [80, 80],
+        "number_of_final_designs": 10,
+        "project_folder": "/data/results/my_target"
+      }
+
+    Other modalities: --modality VHH (drop binder_lengths, the scaffold sets the length),
+    peptide, antibody. List the shipped targets with `design --list-targets`.
+
+    CONFIRM JAX SEES THE CARD BEFORE A LONG CAMPAIGN. JAX warns once and then runs on the
+    CPU, which looks like a working job that will never finish:
+
+      apptainer exec --nv bindcraft2-cu13.sif \
+          python -c "import jax; print(jax.devices()); assert jax.default_backend()=='gpu'"
+
+    One CudaDevice per card is the answer. [CpuDevice(id=0)] means stop and fix it.
+
+    KEEP THE COMPILED-GRAPH CACHE FOR A SWEEP. Each prediction shape costs about 60 s to
+    compile and 1.5 s to read back. This image caches to node-local /tmp, which is lost when
+    the job ends. For a campaign series on nodes carrying the same GPU model, point it at
+    shared storage instead:
+
+      apptainer run --nv --env JAX_COMPILATION_CACHE_DIR=/shared/path/bc2_xla_cache ...
+
+    Use one cache directory per GPU model: a compiled executable is not portable across
+    cards, and mixing them silently defeats the cache.
+
+    MOUNT EVERY TREE YOUR PATHS POINT INTO, including anything a symlink crosses. A
+    parameter or target directory that is a link into an unmounted filesystem exists to
+    `ls` and not to the campaign, and preflight reports it as missing.
+
+    Weights are baked in: BINDCRAFT_WEIGHTS=/opt/bindcraft-weights is the cache root, and
+    the 15 params_*.npz files (monomer, _ptm and _multimer_v3 sets) are one level down in
+    /opt/bindcraft-weights/alphafold/. To use a different copy, set BINDCRAFT_AF2_PARAMS to
+    a directory holding params_<model>.npz -- that is the alphafold/ level, not its parent.
+    It overrides everything.
+
+    Licence: BindCraft2 Source-Available (Hosting-Restricted). Free for any internal use
+    including commercial, and redistribution is allowed; what is restricted is offering the
+    Software itself to third parties as a hosted or managed service. Providing design
+    OUTPUTS (sequences, structures) to others is explicitly permitted. See LICENSE.md.

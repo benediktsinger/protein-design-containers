@@ -1,0 +1,235 @@
+# RISoTTo — Apptainer definition.
+#
+# RIbonucleic acid Sequence design from TerTiary structure: generates RNA sequences
+# predicted to fold into a given backbone, conditioned on the surrounding molecular context
+# (proteins, other nucleic acids, ligands, ions). The architecture closely follows CARBonAra,
+# the same group's protein sequence design model.
+#
+#   apptainer build --fakeroot --build-arg RISOTTO_ACCELERATOR=cu12 risotto-cu12.sif risotto.def
+#   apptainer build --fakeroot --build-arg RISOTTO_ACCELERATOR=cu13 risotto-cu13.sif risotto.def
+#
+# READ THIS BEFORE PICKING cu13.
+#
+# Upstream pins `torch==2.3.1` in requirements.txt and tests on CUDA 12.1. That build
+# compiles sm_50 through sm_90, so it covers Volta, Ampere, Ada and Hopper — but it has NO
+# BLACKWELL KERNELS, and no CUDA 13 build of torch 2.3.1 exists. On an sm_100/sm_120 card it
+# dies at model init with
+#   CUDA error: no kernel image is available for execution on the device
+#
+# So the two builds are not equivalent, and the difference is not only CUDA:
+#
+#   cu12  Exactly upstream's pinned environment (torch 2.3.1). This is the FAITHFUL build
+#         and the one to trust for results you intend to publish.
+#   cu13  Upstream's requirements with the torch pin REMOVED and a current CUDA 13 torch
+#         installed instead. This is the only way to use Blackwell, but it is NOT a
+#         configuration upstream has tested. Torch minor releases have changed reduction
+#         order and default matmul precision before now, and this model samples from a
+#         probability distribution, so a changed numeric path can move the sequences it
+#         produces. Spot-check against a cu12 run before relying on it: the demo in the
+#         upstream README is deterministic for `seq_wt` and `seq_0`, which makes it a usable
+#         check (see %help).
+#
+# Weights ship inside the repository (~15 MB), so there is nothing to download at run time.
+#
+# EternaFold is deliberately NOT built. It is a git submodule needed only to recompute the
+# 2D self-consistency numbers in the paper's benchmark, not to design sequences, and it
+# needs a C++ toolchain. The clone below is therefore not recursive.
+
+BootStrap: docker
+From: python:3.11.14-slim-bookworm
+
+%arguments
+    RISOTTO_ACCELERATOR=cu12
+
+%labels
+    Maintainer  Benedikt Singer
+    Tool        RISoTTo
+    Upstream    https://github.com/LBM-EPFL/RISoTTo
+    Commit      890758882e585ea7ac2567d5801ef3d91e77a80a
+    Accelerator {{ RISOTTO_ACCELERATOR }}
+    License     CC BY-NC-SA 4.0
+
+%environment
+    export RISOTTO_HOME=/opt/RISoTTo
+    export PYTHONNOUSERSITE=1
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    # Large complexes are memory-hungry: upstream measured ~8.8 GB peak for a 9,800-atom
+    # structure, which only fits a 12 GB card with this allocator setting. It costs nothing
+    # on a larger card, so it is on by default.
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+    # The SIF is read-only and $HOME may be unwritable or shared between concurrent jobs.
+    export XDG_CACHE_HOME=/tmp/risotto-cache
+    export MPLCONFIGDIR=/tmp/risotto-cache/mpl
+    export CUDA_CACHE_PATH=/tmp/risotto-cache/nv
+    export TORCH_HOME=/tmp/risotto-cache/torch
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    RISOTTO_ACCELERATOR={{ RISOTTO_ACCELERATOR }}
+    RISOTTO_COMMIT=890758882e585ea7ac2567d5801ef3d91e77a80a
+
+    apt-get update
+    # gcc/g++ are here for parmed, which requirements.txt pins at 4.3.0 and which PyPI
+    # publishes as an sdist only -- no wheel for any version or platform. It compiles
+    # parmed.amber._rdparm, so without a C++ compiler the whole install fails late with
+    # `error: [Errno 2] No such file or directory: 'g++'`. The toolchain is removed again
+    # below, once the install is done.
+    apt-get install -y --no-install-recommends ca-certificates git gcc g++
+    rm -rf /var/lib/apt/lists/*
+
+    python -m pip install --no-cache-dir "uv>=0.13.4"
+
+    # Not recursive: the only submodule is EternaFold, which is benchmark-only (see header).
+    git clone https://github.com/LBM-EPFL/RISoTTo.git /opt/RISoTTo
+    git -C /opt/RISoTTo checkout --quiet "${RISOTTO_COMMIT}"
+    rm -rf /opt/RISoTTo/.git
+
+    cd /opt/RISoTTo
+
+    case "${RISOTTO_ACCELERATOR}" in
+        cu12)
+            # Faithful: requirements.txt exactly as pinned, torch 2.3.1 from PyPI (cu121).
+            uv pip install --system --no-cache -r requirements.txt
+            ;;
+        cu13)
+            # Blackwell: same requirements with the torch pin dropped, then a CUDA 13 torch.
+            # The grep is anchored so it removes the torch pin and nothing that merely
+            # contains the string (torchvision, torchaudio) if upstream adds one later.
+            grep -v -E '^torch==' requirements.txt > /tmp/risotto-req-notorch.txt
+            uv pip install --system --no-cache --torch-backend=cu130 "torch"
+            uv pip install --system --no-cache -r /tmp/risotto-req-notorch.txt
+            ;;
+        *)
+            echo "RISOTTO_ACCELERATOR must be cu12 or cu13 (got '${RISOTTO_ACCELERATOR}')" >&2
+            exit 2
+            ;;
+    esac
+
+    # Drop the compiler again. autoremove is the risky part: it also takes whatever the
+    # toolchain pulled in, and the PYCHECK below is deliberately placed AFTER it so a
+    # removal that breaks torch fails the build here rather than someone's first job.
+    apt-get purge -y gcc g++
+    apt-get autoremove -y
+    rm -rf /var/lib/apt/lists/*
+
+    # Fail the BUILD, not the first job, if the torch that landed cannot serve the
+    # accelerator this image claims. cu13 must carry Blackwell kernels; cu12 must not have
+    # been silently upgraded past the pin.
+    # The shell variable is not visible inside the heredoc unless it is exported, and a
+    # check that silently reads an empty string would assert nothing at all.
+    export RISOTTO_ACCELERATOR_CHECK="${RISOTTO_ACCELERATOR}"
+    python - <<'PYCHECK'
+import os
+
+import parmed
+import torch
+
+accel = os.environ.get("RISOTTO_ACCELERATOR_CHECK", "")
+archs = torch.cuda.get_arch_list()
+print("torch", torch.__version__, "archs", archs)
+print("parmed", parmed.__version__, "(compiled extension imported OK after the purge)")
+
+if accel == "cu13":
+    assert any(a in archs for a in ("sm_100", "sm_120")), \
+        "cu13 build has no Blackwell kernels: {}".format(archs)
+elif accel == "cu12":
+    assert torch.__version__.startswith("2.3.1"), \
+        "cu12 build is meant to be upstream's pinned torch 2.3.1, got {}".format(torch.__version__)
+PYCHECK
+
+    # Convenience entry point. apply_model.py resolves its imports relative to the
+    # repository root, so the wrapper changes directory rather than relying on cwd.
+    printf '#!/bin/sh\ncd /opt/RISoTTo && exec python apply_model.py "$@"\n' > /usr/local/bin/risotto-design
+    chmod 755 /usr/local/bin/risotto-design
+
+    chmod -R a+rX /opt/RISoTTo
+    du -sh /opt/RISoTTo
+
+%test
+    set -eu
+    # CPU-only and driver-free on purpose, so it passes on a build node with no GPU.
+    # IT PROVES NOTHING ABOUT THE TARGET CLUSTER: it never touches the driver and never
+    # launches a CUDA kernel. Only a real job clears the driver and arch gates.
+    python -c "import torch; print('torch', torch.__version__); print('archs:', torch.cuda.get_arch_list())"
+    test -f /opt/RISoTTo/save/model.pt
+    test -f /opt/RISoTTo/test_pdb/1csl.pdb
+
+    # A real forward pass on the CPU, against the structure upstream ships for exactly this.
+    # seq_wt and seq_0 are deterministic, so this checks the model actually runs, not just
+    # that the imports resolve.
+    cd /opt/RISoTTo
+    python apply_model.py --pdb_filepath=test_pdb/1csl.pdb --output_dir=/tmp/risotto-selftest \
+        --num_samples=1 --device=cpu --sampling=max_confidence > /dev/null
+    test -s /tmp/risotto-selftest/1csl_designs.fasta
+    head -2 /tmp/risotto-selftest/1csl_designs.fasta
+    rm -rf /tmp/risotto-selftest
+    echo "RISoTTo self-test OK"
+
+%runscript
+    exec risotto-design "$@"
+
+%help
+    RISoTTo — context-aware geometric deep learning for RNA sequence design.
+
+    Design sequences for an RNA backbone, keeping its molecular context:
+
+      apptainer run --nv --bind "$PWD":/data risotto-cu12.sif \
+          --pdb_filepath /data/structure.pdb \
+          --output_dir /data/out \
+          --num_samples 5 \
+          --imprint_ratio 0.5 \
+          --sampling max_confidence \
+          --device cuda:0
+
+    Output is a FASTA in --output_dir. `seq_wt` is the native sequence read off the
+    structure and `seq_0` the maximum-confidence design, taken from the imprint-free
+    prediction before any sampling. `seq_1` onwards are sampled and differ between runs.
+    Each header carries `recovery` (identity to native) and `confidence` (mean predicted
+    confidence).
+
+    HOW REPRODUCIBLE ARE THOSE? Measured on the shipped test_pdb/1csl.pdb, 28 nt:
+
+      seq_wt   exact, every run, every device. It matches upstream's shipped
+               1csl_designs.fasta byte for byte.
+      seq_0    nothing random touches it, but a position sitting at a near-tie can still
+               flip on a GPU: across five cuda runs, four gave upstream's sequence and one
+               flipped the last nucleotide (A -> U). Two CPU runs were stable and both
+               matched upstream.
+
+    So treat a one-position difference in seq_0 as float noise rather than as a finding,
+    and run comparisons on the CPU when you need an exact answer.
+
+    The input PDB should include the context you want the design conditioned on — proteins,
+    other nucleic acids, ligands and ions all count. Context is the point of the method.
+
+    CHECKING A cu13 IMAGE AGAINST THE PINNED ONE. cu13 does not use upstream's pinned torch
+    (see the header of this file), so it is worth asking whether that moved the numerics.
+
+    RUN THE COMPARISON ON THE CPU. Both images can, and it is the only way to separate a
+    torch-version effect from ordinary GPU nondeterminism -- which on this structure is
+    large enough to flip a nucleotide by itself:
+
+      for sif in risotto-cu12.sif risotto-cu13.sif; do
+        apptainer run $sif --pdb_filepath /opt/RISoTTo/test_pdb/1csl.pdb \
+            --output_dir /tmp/$sif.out --num_samples 0 --device cpu
+      done
+      diff <(grep -A1 '^>seq_0' /tmp/risotto-cu12.sif.out/1csl_designs.fasta) \
+           <(grep -A1 '^>seq_0' /tmp/risotto-cu13.sif.out/1csl_designs.fasta)
+
+    Identical output means the newer torch did not move this model's numerics on that
+    structure. It is one structure, not a proof, but a difference here is a clear warning.
+    Comparing on the GPU instead gives you a one-position diff with no information in it.
+
+    ONE MORE THING ABOUT --num_samples. The sampling loop runs until it has collected
+    num_samples DISTINCT sequences (`while len(seqs_set) < num_samples + 1`), discarding
+    repeats. For a short or heavily constrained RNA the model may simply not produce that
+    many distinct answers, and the loop has no iteration cap -- so an over-ambitious
+    --num_samples does not fail, it hangs. If a job stops making progress, that is where
+    to look.
+
+    CC BY-NC-SA 4.0 — non-commercial use only.

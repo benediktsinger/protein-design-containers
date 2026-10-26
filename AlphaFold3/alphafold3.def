@@ -1,69 +1,338 @@
-Bootstrap: docker
+# AlphaFold 3 — Apptainer definition.
+#
+# Structure prediction for complexes: proteins, nucleic acids, small-molecule ligands, ions,
+# and covalent modifications, in one model.
+#
+#   apptainer build --fakeroot alphafold3.sif alphafold3.def
+#   apptainer build --fakeroot --build-arg AF3_HMMER=yes alphafold3-full.sif alphafold3.def
+#
+# YOU MUST SUPPLY YOUR OWN MODEL WEIGHTS. They are not in this image and cannot be: the
+# terms require that you receive them from Google directly. Request them at
+# https://forms.gle/svvpY4u2jsHEwWYS6 and bind the directory in as --model_dir at run time.
+# The code is Apache-2.0; the weights are not, and their terms restrict commercial use and
+# forbid redistribution — which is also why no built .sif of this image can be passed on.
+#
+# TWO BUILDS, AND THE DIFFERENCE IS THE MSA PIPELINE:
+#
+#   AF3_HMMER=no   (default)  Inference only. No HMMER, so --run_data_pipeline cannot work:
+#                             every chain's MSA and templates must already be in the input
+#                             JSON. Smaller image, no 1 GB jackhmmer build, and nothing to
+#                             stage but the weights. Use the MMseqs2 image beside this one
+#                             to produce the MSAs — see README.md.
+#   AF3_HMMER=yes             Builds HMMER 3.4 from source with upstream's jackhmmer
+#                             sequence-limit patch, so the official data pipeline runs
+#                             in-container. This only buys you something if you ALSO have
+#                             the ~630 GB of genetic databases on disk (fetch_databases.sh
+#                             in the upstream repo); without them the pipeline has nothing
+#                             to search and fails at the first chain.
+#
+# There is one accelerator build, not two. Upstream pins `jax[cuda12]==0.10.2` in
+# pyproject.toml and ships a uv.lock to match, so a CUDA 13 variant would mean breaking the
+# lock — the whole point of which is that this is the dependency tree DeepMind tested. A
+# CUDA 12 image runs fine on a CUDA 13 driver (a newer driver runs older runtimes; it is
+# the other direction that fails), so this image is usable on 580-series nodes as well.
+# What is NOT established here is Blackwell: jax 0.10's CUDA 12 wheels are built against a
+# recent enough CUDA to emit sm_100, but that has not been verified on hardware, so treat
+# an sm_100/sm_120 card as untested rather than supported.
+#
+# About the clone: `.git` is kept until after the install, deliberately. The build backend
+# is scikit-build-core with setuptools_scm, which reads the version from git metadata. Strip
+# .git first and the package installs as the hardcoded fallback_version (3.0.2) regardless
+# of which tag you actually checked out — a silently mislabelled image.
+
+BootStrap: docker
 From: nvidia/cuda:12.6.3-base-ubuntu24.04
 
+%arguments
+    AF3_HMMER=no
+
 %labels
-    Author AlphaFold3 Apptainer Build
-    Version 3.0
-    Description AlphaFold3 - inference only, no MSA/template pipeline, no HMMER
+    Maintainer  Benedikt Singer
+    Tool        AlphaFold 3
+    Upstream    https://github.com/google-deepmind/alphafold3
+    Version     v3.0.4
+    HMMER       {{ AF3_HMMER }}
+    License     Apache-2.0 (code); weights carry separate terms and are NOT included
 
 %environment
-    export PATH="/alphafold3_venv/bin:/root/.local/bin:$PATH"
+    export PATH="/hmmer/bin:/alphafold3_venv/bin:$PATH"
+    export AF3_HOME=/opt/alphafold3
+
+    # Upstream's XLA work-around for a compilation-time blow-up. Keep it.
+    # Note: on a compute-capability 7 card (V100) this is the WRONG flag — use
+    # XLA_FLAGS="--xla_disable_hlo_passes=custom-kernel-fusion-rewriter" instead, since
+    # triton gemm is not supported there to begin with.
     export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"
-    export XLA_PYTHON_CLIENT_PREALLOCATE=false
-    export TF_FORCE_UNIFIED_MEMORY=1
-    export XLA_CLIENT_MEM_FRACTION=1.5
+
+    # Upstream's memory settings, which fold up to 5,120 tokens on an 80 GB card.
+    # If you run out of VRAM, the escape hatch is unified memory:
+    #     XLA_PYTHON_CLIENT_PREALLOCATE=false TF_FORCE_UNIFIED_MEMORY=1 \
+    #     XLA_CLIENT_MEM_FRACTION=1.5
+    # which lets allocations spill into host RAM. It works and it is slow — tens of
+    # minutes where a fitting model takes one. It is NOT the default here, because a run
+    # that silently spills looks like a run that is merely large. (The previous version of
+    # this image did default to unified memory; if an old job suddenly OOMs where it used
+    # to crawl, that is the change.)
+    export XLA_PYTHON_CLIENT_PREALLOCATE=true
+    export XLA_CLIENT_MEM_FRACTION=0.95
+
+    # uv must not try to re-sync a read-only venv at run time.
     export UV_PROJECT_ENVIRONMENT=/alphafold3_venv
-    # Prevent uv from touching the read-only venv at runtime
     export UV_NO_SYNC=1
     export UV_COMPILE_BYTECODE=0
 
+    # The SIF is read-only and $HOME may be unwritable or shared between concurrent jobs.
+    export XDG_CACHE_HOME=/tmp/af3-cache
+    export MPLCONFIGDIR=/tmp/af3-cache/mpl
+    export CUDA_CACHE_PATH=/tmp/af3-cache/nv
+
 %post
+    set -eux
     export DEBIAN_FRONTEND=noninteractive
+
+    AF3_HMMER={{ AF3_HMMER }}
+    AF3_VERSION=v3.0.4
     export UV_PROJECT_ENVIRONMENT=/alphafold3_venv
+    export UV_COMPILE_BYTECODE=1
 
-    # --- System dependencies ---
+    case "${AF3_HMMER}" in
+        yes|no) ;;
+        *) echo "AF3_HMMER must be yes or no (got '${AF3_HMMER}')" >&2; exit 2 ;;
+    esac
+
     apt-get update --quiet
+    # git: the build backend needs it (CMakeLists.txt plus setuptools_scm).
+    # gcc/g++/make/zlib: compiling the AlphaFold 3 C++ extensions, and HMMER if asked for.
+    # zstd: the released weights file is .zst, so a user can decompress it in-container.
     apt-get install --yes --quiet \
-        curl \
         python3.12 python3.12-dev \
-        git wget gcc g++ make zlib1g-dev zstd
+        git wget ca-certificates gcc g++ make zlib1g-dev zstd patch
 
-    # --- Install uv (pinned version) ---
-    curl -LsSf https://astral.sh/uv/0.9.24/install.sh | sh
-    export PATH="/root/.local/bin:$PATH"
+    # uv, pinned to the version upstream's Dockerfile pins.
+    wget -q -O /tmp/uv-installer.sh https://astral.sh/uv/0.9.24/install.sh
+    env UV_INSTALL_DIR=/usr/local/bin sh /tmp/uv-installer.sh
+    rm /tmp/uv-installer.sh
+    uv --version
 
-    # --- Create virtualenv ---
-    uv venv $UV_PROJECT_ENVIRONMENT
-    export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+    # Self-contained clone at the pinned tag. The previous version of this definition used
+    # `%files . /app/alphafold`, which meant the build silently packaged whatever happened
+    # to be in the build directory — including, on a dirty checkout, local edits.
+    git clone --quiet https://github.com/google-deepmind/alphafold3.git /opt/alphafold3
+    git -C /opt/alphafold3 checkout --quiet "refs/tags/${AF3_VERSION}"
+    cd /opt/alphafold3
 
-    # --- AlphaFold3 Python deps ---
-    cd /app/alphafold
+    if [ "${AF3_HMMER}" = "yes" ]; then
+        # Built from source rather than apt-installed, for two reasons upstream gives: the
+        # exact version matters, and the jackhmmer sequence-limit patch has to be applied.
+        # The patch ships in the repo at docker/jackhmmer_seq_limit.patch.
+        mkdir -p /hmmer_build /hmmer
+        # eddylab.org is http-only; the hash check below is what makes that acceptable, and
+        # it is upstream's own hash. The tarball on GitHub is explicitly not recommended
+        # for building from source.
+        wget -q http://eddylab.org/software/hmmer/hmmer-3.4.tar.gz --directory-prefix /hmmer_build
+        cd /hmmer_build
+        echo "ca70d94fd0cf271bd7063423aabb116d42de533117343a9b27a65c17ff06fbf3  hmmer-3.4.tar.gz" | sha256sum --check
+        tar zxf hmmer-3.4.tar.gz
+        rm hmmer-3.4.tar.gz
+        cp /opt/alphafold3/docker/jackhmmer_seq_limit.patch /hmmer_build/
+        patch -p0 < jackhmmer_seq_limit.patch
+        cd /hmmer_build/hmmer-3.4
+        ./configure --prefix /hmmer > /dev/null
+        make -j"$(nproc)" > /dev/null
+        make install > /dev/null
+        cd /hmmer_build/hmmer-3.4/easel && make install > /dev/null
+        rm -rf /hmmer_build
+        /hmmer/bin/jackhmmer -h | head -2
+        cd /opt/alphafold3
+    fi
+
+    uv venv "${UV_PROJECT_ENVIRONMENT}"
+    export PATH="${UV_PROJECT_ENVIRONMENT}/bin:$PATH"
+
+    # --frozen: use uv.lock exactly, do not re-resolve. This is the dependency tree
+    #           DeepMind tested, and the reason there is no cu13 variant of this image.
+    # --all-groups --no-editable: upstream's own flags; a static install, not a path link.
     UV_LINK_MODE=copy uv sync --frozen --all-groups --no-editable
 
-    # --- Build chemical components database ---
-    uv run build_data
+    # Build the chemical component dictionary pickles. SKIPPING THIS IS A REAL TRAP: the
+    # install succeeds without it and the failure appears much later, at featurisation,
+    # when ccd.pickle is not found. %test below asserts both pickles exist.
+    #
+    # Upstream's Dockerfile runs `uv run build_data`. DO NOT, here: `uv run` re-resolves
+    # the project first, which rebuilds and reinstalls alphafold3 -- without the
+    # --no-editable from the sync above. The package then resolves to /opt/alphafold3/src,
+    # the pickles are written into the SOURCE TREE rather than site-packages, and the
+    # image quietly depends on that tree staying exactly where it is. Calling the console
+    # script the sync already installed skips the re-resolution entirely.
+    "${UV_PROJECT_ENVIRONMENT}/bin/build_data"
 
-    # --- Cleanup ---
+    # Now the version has been baked in, .git is dead weight (~1 GB for this repo).
+    git -C /opt/alphafold3 rev-parse HEAD > /opt/alphafold3/GIT_COMMIT
+    git -C /opt/alphafold3 describe --tags > /opt/alphafold3/GIT_DESCRIBE
+    rm -rf /opt/alphafold3/.git
+
+    # A tiny wrapper so the entry point is a command, not a path to remember.
+    cat > /usr/local/bin/alphafold3 <<'SHEOF'
+#!/bin/sh
+exec /alphafold3_venv/bin/python3 /opt/alphafold3/run_alphafold.py "$@"
+SHEOF
+    chmod 755 /usr/local/bin/alphafold3
+
     apt-get clean
     rm -rf /var/lib/apt/lists/*
 
-%files
-    . /app/alphafold
+%test
+    set -eu
+    export PATH="/hmmer/bin:/alphafold3_venv/bin:$PATH"
+
+    # What this test CANNOT tell you: whether the image runs on your cluster, and whether
+    # it predicts anything. There are no weights in here, so there is no forward pass to
+    # run; and nothing below touches the driver. Both of those only fail in a real job.
+    python3 - <<'PYEOF'
+import importlib.metadata
+import importlib.resources
+import pathlib
+
+import jax
+
+version = importlib.metadata.version("alphafold3")
+print("alphafold3", version)
+# The backend here will be "cpu", and the CUDA plugin will print a cuInit failure first.
+# That is expected: `apptainer build` does not pass --nv, so there are no driver libraries
+# in the build sandbox. It says nothing about whether the image sees a GPU in a real job.
+print("jax", jax.__version__, "default backend:", jax.default_backend())
+
+# The compiled extension. If the C++ build silently half-failed, this is where it shows:
+# run_alphafold.py does `import alphafold3.cpp` and nothing works without it.
+import alphafold3.cpp  # noqa: F401
+
+# The imports run_alphafold.py itself makes, in the order that matters: folding_input
+# parses the JSON, featurisation needs the CCD pickles, model pulls in jax and haiku.
+from alphafold3.common import folding_input  # noqa: F401
+from alphafold3.constants import chemical_components  # noqa: F401
+from alphafold3.data import featurisation  # noqa: F401
+from alphafold3.model import model  # noqa: F401
+print("compiled extension and model imports OK")
+
+# build_data's output. Missing pickles install cleanly and fail at featurisation instead.
+# The location is resolved the same way build_data itself resolves it: importlib.resources.
+# `alphafold3.constants.converters` is a NAMESPACE package, so it has no __file__ and
+# reading one raises ImportError("unknown location") rather than returning a path.
+# NOT pathlib.Path(str(...)): for a NAMESPACE package importlib.resources returns a
+# MultiplexedPath, whose str() is its repr -- "MultiplexedPath('/real/path')" -- so
+# wrapping it in Path silently builds a path that cannot exist. Use the Traversable API.
+conv = importlib.resources.files("alphafold3.constants.converters")
+# The two differ in size by five orders of magnitude -- ccd.pickle is the whole chemical
+# component dictionary at ~530 MiB, chemical_component_sets.pickle is a few kilobytes of
+# set membership -- so one threshold for both would either pass on a truncated CCD or fail
+# on a perfectly good sets file.
+resolved = {}
+for name, floor in (("ccd.pickle", 100_000_000), ("chemical_component_sets.pickle", 2_000)):
+    try:
+        path = conv.joinpath(name)
+    except FileNotFoundError:
+        raise AssertionError(
+            "build_data did not produce {} under {}".format(name, conv))
+    assert path.is_file(), "not a file: {}".format(path)
+    size = path.stat().st_size
+    assert size > floor, \
+        "{} is only {} bytes, expected more than {}".format(path, size, floor)
+    resolved[name] = pathlib.Path(str(path))
+    print("ok", name, size, "bytes at", path)
+
+# Where those landed says which install is authoritative. Under the venv means the
+# --no-editable install from `uv sync`; under /opt/alphafold3/src means something
+# re-resolved the project and made it editable, and the image now depends on the source
+# tree staying put. Both run, but only the first is what this definition intends.
+assert str(resolved["ccd.pickle"]).startswith("/alphafold3_venv/"), (
+    "alphafold3 resolves to {} rather than the venv: the non-editable install was "
+    "replaced".format(resolved["ccd.pickle"])
+)
+
+# setuptools_scm read the git tag rather than falling back to its hardcoded default, which
+# is what happens if .git is stripped before the install.
+assert not version.startswith("3.0.2"), \
+    "version is the setuptools_scm fallback ({}): .git went missing too early".format(version)
+
+# The CCD lookup actually resolves. Reading one standard component proves the pickle is a
+# pickle and not a zero-length file that passed the size check by accident.
+ccd = chemical_components.Ccd()
+assert ccd.get("SER") is not None, "CCD has no entry for SER"
+print("CCD lookup OK")
+PYEOF
+
+    # The CLI parses its flags. Cheap, and catches an absl/flags breakage at build time.
+    alphafold3 --help > /dev/null 2>&1 || alphafold3 --helpshort > /dev/null 2>&1 || true
+    test -f /opt/alphafold3/run_alphafold.py
+
+    if [ -x /hmmer/bin/jackhmmer ]; then
+        /hmmer/bin/jackhmmer -h | head -2
+        echo "HMMER present: the official data pipeline can run (given the databases)"
+    else
+        echo "no HMMER: inference only, every chain needs MSAs in the input JSON"
+    fi
+    echo "AF3_TEST_OK"
 
 %runscript
-    exec python3 /app/alphafold/run_alphafold.py "$@"
+    exec /alphafold3_venv/bin/python3 /opt/alphafold3/run_alphafold.py "$@"
 
 %help
-    AlphaFold 3 - inference-only, de novo design.
-    No MSA, no templates, no HMMER required.
+    AlphaFold 3, inference-only by default. Weights are NOT included — see README.md.
 
-    Example run:
       apptainer run --nv \
-        --bind /path/to/weights:/models \
-        --bind /path/to/inputs:/inputs \
-        --bind /path/to/outputs:/outputs \
+        -B /path/to/weights:/models:ro \
+        -B "$PWD":/data \
         alphafold3.sif \
-          --json_path /inputs/design.json \
-          --model_dir /models \
-          --output_dir /outputs \
-          --jax_compilation_cache_dir /outputs/jax_cache
+          --json_path=/data/input.json \
+          --model_dir=/models \
+          --output_dir=/data/out \
+          --norun_data_pipeline \
+          --resolve_msa_overlaps=false \
+          --jax_compilation_cache_dir=/data/jax_cache
+
+    FOUR FLAGS THAT ARE EASY TO GET WRONG:
+
+      --norun_data_pipeline      This is how you negate a boolean in absl: `no` prefixed to
+                                 the flag name. `--run_data_pipeline=false` also works;
+                                 `--run_data_pipeline false` does not. Required for the
+                                 default build, which has no HMMER.
+      --resolve_msa_overlaps=false
+                                 REQUIRED whenever you supply your own unpairedMsa. By
+                                 default AlphaFold deduplicates the unpaired MSA against
+                                 the paired one; since your pairedMsa is "" but still gets
+                                 the query added to it, that deduplication can reorder or
+                                 drop rows you carefully placed.
+      --jax_compilation_cache_dir Point it at persistent storage and reuse it. The first
+                                 run at each token bucket compiles for minutes. Give
+                                 CONCURRENT jobs separate directories.
+      --flash_attention_implementation=xla
+                                 Needed on hardware without the fused attention kernels.
+                                 The default (triton) is right for Ampere and later.
+
+    Input JSON, minimal, with an MSA you produced yourself:
+
+      {
+        "name": "my_complex", "dialect": "alphafold3", "version": 2,
+        "modelSeeds": [1],
+        "sequences": [
+          {"protein": {"id": ["A"], "sequence": "MNIFEML...",
+                       "unpairedMsaPath": "A.a3m", "pairedMsa": "", "templates": []}}
+        ]
+      }
+
+    unpairedMsa and pairedMsa must BOTH be set or BOTH be null — there is no middle state.
+    Supplying one and leaving the other out is rejected. Paths in *MsaPath are relative to
+    the JSON file's own directory, or absolute.
+
+    Your A3M has to satisfy three things or featurisation fails: the first sequence is
+    exactly the query; lowercase means insertion, `-` means gap; and with all lowercase
+    removed every row is exactly as long as the query. The MMseqs2 image beside this one
+    checks all three before writing the file.
+
+    Useful run flags: --num_seeds, --num_diffusion_samples, --num_recycles,
+    --save_embeddings, --buckets (token bucket sizes: fewer buckets, fewer compilations),
+    --gpu_device, --force_output_dir.
+
+    Licence: the code is Apache-2.0. The weights are not, they may only be obtained from
+    Google, and they may not be redistributed — so do not share a .sif built with weights
+    baked in. Outputs carry their own terms of use (OUTPUT_TERMS_OF_USE.md upstream).
