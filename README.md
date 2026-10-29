@@ -27,6 +27,21 @@ repository, a new workflow and a different licence. Both are kept deliberately.
 See [LINK_COLLECTION.md](LINK_COLLECTION.md) for online demos and further tools not yet
 containerised here.
 
+## Using these with a coding agent
+
+Each tool's `README.md` is written to be read by a person or an agent before a job is
+submitted: it says which build to pick and why, what the container's self-test does and
+does not prove, and the mistakes that cost us time.
+
+There is also a set of **Claude Code skills** that put this material in front of an agent at
+the moment it needs it — one per tool, plus one on choosing a build for a given driver and
+GPU. Those live in our institution's internal mirror of this repository rather than here,
+because they are written against specific clusters: they name hosts, partitions, filesystem
+paths and account codes, none of which belong in a public repo and none of which would be
+correct anywhere else. If you are at the same institution, ask and you will be pointed at
+them. If you are not, the per-tool `README.md` files carry the same lessons in portable
+form, which is what the skills summarise.
+
 ## How to Get the Already Built Containers
 
 If you don't want to build the containers yourself, feel free to reach out and I can send you the pre-built `.sif` files individually.
